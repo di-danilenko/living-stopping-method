@@ -165,7 +165,11 @@ for d in iter_datasets():
 
                 retrain = False
                 if retrain:
-                    clf.fit(seen_df.dropna(subset=['text','incl'])['text'], seen_df.dropna(subset=['text','incl'])['incl'])
+                    clf = GridSearchCV(pipeline, parameters)
+                    clf.fit(
+                        seen_df.dropna(subset=['text','incl'])['text'], 
+                        seen_df.dropna(subset=['text','incl'])['incl'],
+                    )
                     clf.best_estimator_
                     results = pd.DataFrame(clf.cv_results_)
                     results.head()
@@ -175,7 +179,7 @@ for d in iter_datasets():
                     fig, ax = plt.subplots()
 
                     ax.boxplot(f1_scores)
-                    ax.set_ylim([0,1])
+                    ax.set_ylim((0,1))
                     ax.grid(axis="y")
                     ax.set_xticklabels(["Best performing model"])
                     ax.set_ylabel('F1 score')
