@@ -13,7 +13,7 @@ pd.set_option('display.max_columns', 20)
 
 # load all synergy datasets incl. PY
 for d in iter_datasets():
-    globals()[d.name] = pd.read_csv(f"synergy_datasets/{d.name}.csv")
+    globals()[d.name] = pd.read_csv(f"synergy_datasets/{d.name}.csv") # I guess there is another script somewhere that gets these and loads the publication year? Would be good to commit this
     globals()[d.name] = globals()[d.name].rename(columns={"label_included":"incl"})
     print(f"have loaded {d.name} dataset")
 
@@ -117,6 +117,9 @@ for d in iter_datasets():
                 # create a random sample (N = 10% df.shape[0] but min=250 and max=500)
                 N = int(max(100, min(0.1 * df_part.shape[0], 500)))
 
+                # Instead of doing this, I think it would make more sense to keep drawing random records until the conditions are met
+                # Otherwise, for difficult datasets with low prevalence, we only use them with nice draws, where in real life we would
+                # not be able to simply generate a new sample, we'd only be able to keep drawing new documents
                 # exclude datasets where we can't find enough included docs
                 for rs in range(1000):
                     idx = df_part.sample(n=N, random_state=rs).index
@@ -138,217 +141,117 @@ for d in iter_datasets():
                 print(f"Relevant documents identified: {df_part[df_part['sim_seen'] == 1]['incl'].sum()}")
                 print(f"Relevance rate across the dataset: {df_part[df_part['sim_seen'] == 1]['incl'].sum()/len(df_part[df_part['sim_seen'] == 1]['incl'])}")
 
-                # simulate screening effort within this partial review
-                n = int(max(100, min(0.1 * df_part.shape[0], 500)))
-                print(f'Simulating stopping methods with batch size = {n}')
-                seen_df_part = df_part[df_part['sim_seen'] == 1] # started with a random sample
-                df_result = seen_df_part
-                # seen_df_part['sim_order'] = range(1*y, len(seen_df_part) + 1*y) 
-                # this way, we'll avoid having multiple documents with the same simulated order of screening
-                print(seen_df_part.shape[0])
+            # simulate screening effort within this partial review
+            n = int(max(100, min(0.1 * df_part.shape[0], 500)))
+            print(f'Simulating stopping methods with batch size = {n}')
+            seen_df_part = df_part[df_part['sim_seen'] == 1] # started with a random sample
+            df_result = seen_df_part
+            # seen_df_part['sim_order'] = range(1*y, len(seen_df_part) + 1*y) 
+            # this way, we'll avoid having multiple documents with the same simulated order of screening
+            print(seen_df_part.shape[0])
 
-                # simulate screening effort within this partial review
-                while seen_df_part.shape[0] < x:
-                    seen_index = df_part[df_part['sim_seen'] == 1].index
-                    x_train_seen = x_train[seen_index]
-                    full_index = df_part.index
-                    x_train_full = x_train[full_index]
-                    unseen_index = df_part[df_part['sim_seen'] == 0].index
-                    x_train_unseen = x_train[unseen_index]
+            # simulate screening effort within this partial review
+            while seen_df_part.shape[0] < x:
+                seen_index = df_part[df_part['sim_seen'] == 1].index
+                x_train_seen = x_train[seen_index]
+                full_index = df_part.index
+                x_train_full = x_train[full_index]
+                unseen_index = df_part[df_part['sim_seen'] == 0].index
+                x_train_unseen = x_train[unseen_index]
 
-                    # fit the model on the seen documents
-                    # either retrain or load best-performing
-                    # if we retrain here it takes very LONG
+                # fit the model on the seen documents
+                # either retrain or load best-performing
+                # if we retrain here it takes very LONG
 
-                    retrain = False
-                    if retrain:
-                        clf.fit(seen_df.dropna(subset=['text','incl'])['text'], seen_df.dropna(subset=['text','incl'])['incl'])
-                        clf.best_estimator_
-                        results = pd.DataFrame(clf.cv_results_)
-                        results.head()
-                        f1_scores = [results[f"split{x}_test_score"].values[0] for x in range(5)]
-                        print(np.mean(f1_scores))
+                retrain = False
+                if retrain:
+                    clf = GridSearchCV(pipeline, parameters)
+                    clf.fit(
+                        seen_df.dropna(subset=['text','incl'])['text'], 
+                        seen_df.dropna(subset=['text','incl'])['incl'],
+                    )
+                    clf.best_estimator_
+                    results = pd.DataFrame(clf.cv_results_)
+                    results.head()
+                    f1_scores = [results[f"split{x}_test_score"].values[0] for x in range(5)]
+                    print(np.mean(f1_scores))
 
-                        fig, ax = plt.subplots()
+                    fig, ax = plt.subplots()
 
-                        ax.boxplot(f1_scores)
-                        ax.set_ylim([0,1])
-                        ax.grid(axis="y")
-                        ax.set_xticklabels(["Best performing model"])
-                        ax.set_ylabel('F1 score')
+                    ax.boxplot(f1_scores)
+                    ax.set_ylim((0,1))
+                    ax.grid(axis="y")
+                    ax.set_xticklabels(["Best performing model"])
+                    ax.set_ylabel('F1 score')
 
-                    else:
-                        clf = SVC(C=0.25, probability=True, class_weight='balanced')
-                        part1_time = timeit.timeit(stmt=lambda:
-                        # no time to retrain, we'll just take the pipeline with the best performance from last time
-                        clf.fit(x_train_seen, seen_df_part.dropna(subset=['text','incl'])['incl']), number=1)
-                        print(f"clf.fit took: {part1_time:.2f} seconds")
+                else:
+                    clf = SVC(C=0.25, probability=True, class_weight='balanced')
+                    part1_time = timeit.timeit(stmt=lambda:
+                    # no time to retrain, we'll just take the pipeline with the best performance from last time
+                    clf.fit(x_train_seen, seen_df_part.dropna(subset=['text','incl'])['incl']), number=1) # We should probably drop these NAs at the beginning?
+                    print(f"clf.fit took: {part1_time:.2f} seconds")
 
-                        # predict relevance of the remaining documents (from the entire dataset)
-                        start_time = time.time()
-                        y_pred = clf.predict_proba(x_train_unseen)
-                        elapsed_time = time.time() - start_time
-                        print(f"clf.predict_proba took: {elapsed_time:.2f} seconds")
+                    # predict relevance of the remaining documents (from the entire dataset)
+                    start_time = time.time()
+                    y_pred = clf.predict_proba(x_train_unseen)
+                    elapsed_time = time.time() - start_time
+                    print(f"clf.predict_proba took: {elapsed_time:.2f} seconds")
 
-                        # put these predictions in the "prediction" column of the dataframe
-                        df_part.loc[unseen_index,'prediction'] = y_pred[:,1]
-                        pdf_part = df_part.loc[unseen_index].sort_values('prediction', ascending=False)
+                    # put these predictions in the "prediction" column of the dataframe
+                    df_part.loc[unseen_index,'prediction'] = y_pred[:,1]
+                    pdf_part = df_part.loc[unseen_index].sort_values('prediction', ascending=False)
 
-                        # get an n batch with highest_predictions
-                        batch_idx = pdf_part[:n].index
-                        valid_batch_idx = [idx for idx in batch_idx if idx in df_part.loc[unseen_index].index]
-                        df_part.loc[valid_batch_idx,'sim_seen'] = 1
-                        pdf_part.loc[valid_batch_idx,'sim_seen'] = 1
-                        # seen_df = df[df['seen'] == 1]
-                        seen_df_part = pd.concat([seen_df_part, pdf_part[:n]], ignore_index=True) # does it make a difference whether we use df_part or pdf_part here?
-                        # they will be added in a simulated order
-                        print(seen_df_part.shape[0])
+                    # get an n batch with highest_predictions
+                    batch_idx = pdf_part[:n].index
+                    valid_batch_idx = [idx for idx in batch_idx if idx in df_part.loc[unseen_index].index]
+                    df_part.loc[valid_batch_idx,'sim_seen'] = 1
+                    pdf_part.loc[valid_batch_idx,'sim_seen'] = 1
+                    # seen_df = df[df['seen'] == 1]
+                    seen_df_part = pd.concat([seen_df_part, pdf_part[:n]], ignore_index=True) # does it make a difference whether we use df_part or pdf_part here?
+                    # Yes, df_part contains all documents, if I understand correctly, and pdf_part is just the latest batch
+                    # they will be added in a simulated order
+                    print(seen_df_part.shape[0])
 
-                df_result = pd.concat([df_result, seen_df_part], ignore_index=True)
-                
-                # calculate p-values for a recall target 
-                seen_documents = df_result['incl']
-                res = retrospective_h0(seen_documents, df_result.shape[0], batch_size=n, recall_target=recall_target)
+            df_result = pd.concat([df_result, seen_df_part], ignore_index=True)
+            
+            # calculate p-values for a recall target 
+            seen_documents = df_result['incl']
+            res = retrospective_h0(seen_documents, df_result.shape[0], batch_size=n, recall_target=recall_target)
 
-                res_df = pd.DataFrame(res)
-                res_df = res_df.rename(columns={'p': col_name})
-                res_df = res_df.astype({'batch_sizes':'int32'})
+            res_df = pd.DataFrame(res)
+            res_df = res_df.rename(columns={'p': col_name})
+            res_df = res_df.astype({'batch_sizes':'int32'})
 
-                df_result['batch_size_group'] = [assign_batch(idx, n) for idx in df_result.index]
-                df_result = df_result.merge(
-                    res_df[[col_name, 'batch_sizes']], 
-                    left_on='batch_size_group', right_on='batch_sizes', how='left')
-                
-                 # drop the helper column to avoid conflict on next iteratio
-                df_result.drop(columns=['batch_sizes','batch_size_group'], inplace=True)
-                print(f"merged p-values for {recall_target}")
+            df_result['batch_size_group'] = [assign_batch(idx, n) for idx in df_result.index]
+            df_result = df_result.merge(
+                res_df[[col_name, 'batch_sizes']], 
+                left_on='batch_size_group', right_on='batch_sizes', how='left')
+            
+                # drop the helper column to avoid conflict on next iteratio
+            df_result.drop(columns=['batch_sizes','batch_size_group'], inplace=True)
+            print(f"merged p-values for {recall_target}")
 
-                # this way we can store p-values for different reviews (updates) within the living review 
-                col_name_y = col_name + '_' + str(y)
-                df_result = df_result.rename(columns={col_name: col_name_y})
-                # assume all documents where batch > stopping_batch sim_seen = 0 in df_result
-                # how do we avoid premature cutoff for all future iterations? (i.e. if the desirable p-value had been reached in a prior iteration)? 
-                # seems like for some reviews with very low relevance rate, the stopping method can be triggered prematurely too 
-                # which is something we would like to keep and show but need to built in a workaround for this error
-                
-                # we need to first reset the sim_seen column
-                df_result.loc[df_result[col_name_y] >= 0.05, 'sim_seen'] = 1
-                df_result.loc[df_result[col_name_y] < 0.05, 'sim_seen'] = 0
-                # was the recall target and desired p-value reached at all? 
-                print(f"The lowest p-value for the recall target {recall_target} was {min(df_result[col_name_y])}")
-
-
-                ### ADDED BECAUSE THE SAME RECORD WAS SEEN / NOT SEEN IN DIFFERENT UPDATES WHICH CAUSED MULTIPLE ENTRIES PER ID -- NEED TO RESOLVE ### 
-                # Identify the 'id's present in seen_df_part
-                seen_ids = set(df_result.loc[df_result['sim_seen'] == 1, 'id'])
-                # Update 'sim_seen' to 1 where 'id' is in seen_ids
-                df.loc[df['id'].isin(seen_ids), 'sim_seen'] = 1
-
-            else:
-                # for y>1, use previously seen documents for training, rather than doing a random sample again
-                # seen_df_part = df_part[df_part['sim_seen'] == 1] # this lost the order of screening !!!!!!!!!!
-                seen_df_part = df_result[df_result['sim_seen'] == 1]
-                print(f"In review number {y}, we start with {seen_df_part.shape[0]} documents that had been seen in (a) previous review(s).")
-                seen_df_part['sim_order'] = range(1, len(seen_df_part) + 1)
-                # simulate screening effort within this partial review
-                n = int(max(100, min(0.1 * df_part.shape[0], 500)))
-                print(f'Simulating stopping methods with batch size = {n}')
-
-                # simulate screening effort within this partial review
-                while seen_df_part.shape[0] < x: # we loaded only the documents we have actually seen in previous review (masking everything when p_value<0.05)
-                    seen_index = df_part[df_part['sim_seen'] == 1].index
-                    x_train_seen = x_train[seen_index]
-                    full_index = df_part.index
-                    x_train_full = x_train[full_index]
-                    unseen_index = df_part[df_part['sim_seen'] == 0].index
-                    x_train_unseen = x_train[unseen_index]
-
-                    # fit the model on the seen documents
-                    # either retrain or load best-performing
-                    # if we retrain here it takes very LONG
-
-                    retrain = False
-                    if retrain:
-                        clf.fit(seen_df.dropna(subset=['text','incl'])['text'], seen_df.dropna(subset=['text','incl'])['incl'])
-                        clf.best_estimator_
-                        results = pd.DataFrame(clf.cv_results_)
-                        results.head()
-                        f1_scores = [results[f"split{x}_test_score"].values[0] for x in range(5)]
-                        print(np.mean(f1_scores))
-
-                        fig, ax = plt.subplots()
-
-                        ax.boxplot(f1_scores)
-                        ax.set_ylim([0,1])
-                        ax.grid(axis="y")
-                        ax.set_xticklabels(["Best performing model"])
-                        ax.set_ylabel('F1 score')
-
-                    else:
-                        clf = SVC(C=0.25, probability=True, class_weight='balanced')
-                        part1_time = timeit.timeit(stmt=lambda:
-                        # no time to retrain, we'll just take the pipeline with the best performance from last time
-                        clf.fit(x_train_seen, seen_df_part.dropna(subset=['text','incl'])['incl']), number=1)
-                        print(f"clf.fit took: {part1_time:.2f} seconds")
-
-                        # predict relevance of the remaining documents (from the entire dataset)
-                        start_time = time.time()
-                        y_pred = clf.predict_proba(x_train_unseen)
-                        elapsed_time = time.time() - start_time
-                        print(f"clf.predict_proba took: {elapsed_time:.2f} seconds")
-
-                        # put these predictions in the "prediction" column of the dataframe
-                        df_part.loc[unseen_index,'prediction'] = y_pred[:,1]
-                        pdf_part = df_part.loc[unseen_index].sort_values('prediction', ascending=False)
-
-                        # get an n batch with highest_predictions
-                        batch_idx = pdf_part[:n].index
-                        valid_batch_idx = [idx for idx in batch_idx if idx in df_part.loc[unseen_index].index]
-                        df_part.loc[valid_batch_idx,'sim_seen'] = 1
-                        pdf_part.loc[valid_batch_idx,'sim_seen'] = 1
-                        # seen_df = df[df['seen'] == 1]
-                        seen_df_part = pd.concat([seen_df_part, pdf_part[:n]], ignore_index=True)
-                        # they will be added in a simulated order
-                        print(seen_df_part.shape[0])
-
-                df_result = pd.concat([df_result, seen_df_part], ignore_index=True)
-                                # calculate p-values for a recall target 
-                seen_documents = df_result['incl']
-                res = retrospective_h0(seen_documents, df_result.shape[0], batch_size=n, recall_target=recall_target)
-
-                res_df = pd.DataFrame(res)
-                res_df = res_df.rename(columns={'p': col_name})
-                res_df = res_df.astype({'batch_sizes':'int32'})
-
-                df_result['batch_size_group'] = [assign_batch(idx, n) for idx in df_result.index]
-                df_result = df_result.merge(
-                    res_df[[col_name, 'batch_sizes']], 
-                    left_on='batch_size_group', right_on='batch_sizes', how='left')
-                
-                 # drop the helper column to avoid conflict on next iteration
-                df_result.drop(columns=['batch_sizes','batch_size_group'], inplace=True)
-                print(f"merged p-values for {recall_target}")
-
-                # this way we can store p-values for different reviews (updates) within the living review 
-                col_name_y = col_name + '_' + str(y)
-                df_result = df_result.rename(columns={col_name: col_name_y})
-                # assume all documents where batch > stopping_batch sim_seen = 0 in df_result
-                # how do we avoid premature cutoff for all future iterations? (i.e. if the desirable p-value had been reached in a prior iteration)? 
-                # seems like for some reviews with very low relevance rate, the stopping method can be triggered prematurely too 
-                # which is something we would like to keep and show but need to built in a workaround for this error
-                
-                # we need to first reset the sim_seen column
-                df_result.loc[df_result[col_name_y] >= 0.05, 'sim_seen'] = 1
-                df_result.loc[df_result[col_name_y] < 0.05, 'sim_seen'] = 0
-                # was the recall target and desired p-value reached at all? 
-                print(f"The lowest p-value for the recall target {recall_target} was {min(df_result[col_name_y])}")
+            # this way we can store p-values for different reviews (updates) within the living review 
+            col_name_y = col_name + '_' + str(y)
+            df_result = df_result.rename(columns={col_name: col_name_y})
+            # assume all documents where batch > stopping_batch sim_seen = 0 in df_result
+            # how do we avoid premature cutoff for all future iterations? (i.e. if the desirable p-value had been reached in a prior iteration)? 
+            # seems like for some reviews with very low relevance rate, the stopping method can be triggered prematurely too 
+            # which is something we would like to keep and show but need to built in a workaround for this error
+            
+            # we need to first reset the sim_seen column
+            df_result.loc[df_result[col_name_y] >= 0.05, 'sim_seen'] = 1
+            df_result.loc[df_result[col_name_y] < 0.05, 'sim_seen'] = 0
+            # was the recall target and desired p-value reached at all? 
+            print(f"The lowest p-value for the recall target {recall_target} was {min(df_result[col_name_y])}")
 
 
-                ### ADDED BECAUSE THE SAME RECORD WAS SEEN / NOT SEEN IN DIFFERENT UPDATES WHICH CAUSED MULTIPLE ENTRIES PER ID -- NEED TO RESOLVE ### 
-                # Identify the 'id's present in seen_df_part
-                seen_ids = set(df_result.loc[df_result['sim_seen'] == 1, 'id'])
-                # Update 'sim_seen' to 1 where 'id' is in seen_ids
-                df.loc[df['id'].isin(seen_ids), 'sim_seen'] = 1
+            ### ADDED BECAUSE THE SAME RECORD WAS SEEN / NOT SEEN IN DIFFERENT UPDATES WHICH CAUSED MULTIPLE ENTRIES PER ID -- NEED TO RESOLVE ### 
+            # Identify the 'id's present in seen_df_part
+            seen_ids = set(df_result.loc[df_result['sim_seen'] == 1, 'id'])
+            # Update 'sim_seen' to 1 where 'id' is in seen_ids
+            df.loc[df['id'].isin(seen_ids), 'sim_seen'] = 1
+
             y +=1
         df_result.to_csv(results_folder / results_file, index=False)
         print(f"saved a csv of simulated screening for dataset {d.name} (recall target: {recall_target})")    
