@@ -1,78 +1,67 @@
 ### TO-DO ###
-# current fix of clf.fit results in that we dont go over all the N documents
-# restrict to only the last iteration of each result dataframe?
-# adjust column names where needed
+# check how we handle the multiple iterations in the simulated screening results (i.e. seen in iteration 1-3, p-value, etc.)
 # add a loop for dataset, review iteration, recall target, confidence level, random state
-# add a dynamic recall iteration trigger instead of a fixed number of reviews for all datasets
-# add reordering based on predictions from the model
+# add a dynamic review iteration trigger instead of a fixed number of reviews for all datasets
+# add reordering based on predictions from the model (experiment 3)
 
-def plot_screeningprogress(dataset_name="Bos_2018", title="Cumulative included documents"):
+import pandas as pd
+dataset_name = "Bos_2018"
+RECALL_TARGET = 0.99
+df = pd.read_csv(f"simulated_screening/{dataset_name}-{RECALL_TARGET}-results-2-v1.csv")
+seen_df = df.loc[df['sim_seen'] == 1]
+seen_documents = df.loc[df['sim_seen'] == 1, 'incl']
+
+def plot_screeningprogress(df, seen_documents, title="Cumulative included documents", recall_target=0.8):
     import matplotlib.pyplot as plt
     import pandas as pd
     from buscarpy import retrospective_h0
-    df = pd.read_csv(f"simulated_screening-2-v1/{dataset_name}-0.8-results-2-v1.csv")
-    # df = df.sort_values(by=['sim_order'])
-    # sim_order repeats values across different updates of the review
-    unique_id_count = df['id'].nunique()
-    print("Unique id count:", unique_id_count)
-    # TO ADD drop duplicates, keep the last iteration only
-    df = df.drop_duplicates(subset=['id'], keep='last').reset_index(drop=True)
-    print("Dataframe shape after dropping duplicates:", df.shape)
-    # We want to somehow display screening effort over different iterations of the review too, though DISCUSS what a good visualisation would be
-    print(df['sim_seen'].value_counts())
-    # Print summary stats for buscar_p_r_080_1, buscar_p_r_080_2, buscar_p_r_080_3 if present
-    for col in ['buscar_p_r080_1', 'buscar_p_r080_2', 'buscar_p_r080_3']:
-        if col in df.columns:
-            print(f"Summary stats for {col}:")
-            print(df[col].describe())
-            print()
+
 
     df.incl.cumsum().plot()
-    plt.savefig(f'simulated_screening-2-v1/{dataset_name}-0.95-results-2-v1_incl_cumsum.png')
-
-    seen_documents = df.loc[df['sim_seen'] == 1, 'incl']
+    plt.savefig(f'simulated_screening/{dataset_name}-{recall_target}-2-v1_incl_cumsum.png')
 
     fig, ax = plt.subplots()
     seen_documents.cumsum().plot()
     ax.set_xlim(xmax=df.shape[0]+50)
-    plt.savefig(f'simulated_screening-2-v1/{dataset_name}-0.95-results-2-v1_seen_documents_cumsum.png')
+    plt.savefig(f'simulated_screening/{dataset_name}-{recall_target}-2-v1_seen_documents_cumsum.png')
 
 # calculate true recall and work savings
-def calculate_true_recall(seen_df_part, df):
-    true_recall = seen_df_part.loc[seen_df_part['seen'] == 1]['label_included'].sum()/df['label_included'].sum() 
+# how do we get seen_df_part?
+def calculate_true_recall(seen_df, df):
+    true_recall = seen_df.loc[seen_df['sim_seen'] == 1]['incl'].sum()/df['incl'].sum() 
     return true_recall
 
-def calculate_missed_includes(seen_df_part, df):
-    missed_includes = df['label_included'].sum() - seen_df_part.loc[seen_df_part['seen'] == 1]['label_included'].sum()
+def calculate_missed_includes(seen_df, df):
+    missed_includes = df['incl'].sum() - seen_df.loc[seen_df['sim_seen'] == 1]['incl'].sum()
     return missed_includes
 
-def calculate_work_savings(seen_df_part, df):
-    work_savings = 1 - seen_df_part.loc[seen_df_part['seen'] == 1].shape[0] / df.shape[0]
+def calculate_work_savings(seen_df, df):
+    work_savings = 1 - seen_df.loc[seen_df['sim_seen'] == 1].shape[0] / df.shape[0]
     return work_savings
 
-def plot_screeningprogress_with_stoppingpoints(seen_documents, df, n, dataset_name="Bos_2018"):
+def plot_screeningprogress_with_stoppingpoints(df, seen_documents, recall_target=0.8, n=100):
     import matplotlib.pyplot as plt
     import os
     from buscarpy import retrospective_h0
+    import pandas as pd
+
+    df = pd.read_csv(f"simulated_screening/{dataset_name}-{recall_target}-results-2-v1.csv")
+    seen_documents = df.loc[df['sim_seen'] == 1, 'incl']
+    
+    # batch_size = int(max(100, min(0.1 * df_part.shape[0], 500))) 
 
     # add different possible recall targets to the graph
-    h0_99 = retrospective_h0(seen_documents, df.shape[0], batch_size=5*n, recall_target=0.99, plot=False)
-    h0_95 = retrospective_h0(seen_documents, df.shape[0], batch_size=5*n, recall_target=0.95, plot=False)
-    h0_9 = retrospective_h0(seen_documents, df.shape[0], batch_size=5*n, recall_target=0.9, plot=False)
-    h0_75 = retrospective_h0(seen_documents, df.shape[0], batch_size=5*n, recall_target=0.75, plot=False)
+    h0 = retrospective_h0(seen_documents, df.shape[0], batch_size=5*n, recall_target=recall_target, plot=False)
 
     fig, ax = plt.subplots()
-
     ax.plot(seen_documents.cumsum())
     ax2 = ax.twinx()
 
-    ax2.scatter(h0_99['batch_sizes'], h0_99['p'], label='recall==0.99')
-    ax2.scatter(h0_95['batch_sizes'], h0_95['p'], label='recall==0.95')
-    ax2.scatter(h0_9['batch_sizes'], h0_9['p'], label='recall==0.9')
-    ax2.scatter(h0_75['batch_sizes'], h0_75['p'], label='recall==0.75')
+    ax2.scatter(h0['batch_sizes'], h0['p'], label=f'recall=={recall_target}')
 
-    # Function to find the minimum batch size where p < 0.05
-    def get_min_batch_size(data):
+    # Find the minimum batch size where p < 0.05
+    def get_min_batch_size(data): 
+        # check whether this also gets us ALL the local minima (points in the screening curve where we'd have stopped in all iterations)
         # Find indices where p < 0.05
         indices = [i for i, value in enumerate(data['p']) if value < 0.05]
         if indices:  # Check if there are any indices found
@@ -80,21 +69,10 @@ def plot_screeningprogress_with_stoppingpoints(seen_documents, df, n, dataset_na
             return min(data['batch_sizes'][i] for i in indices)
         return None
 
-    # Get the minimum batch sizes for each recall target
-    min_batch_size_99 = get_min_batch_size(h0_99)
-    min_batch_size_95 = get_min_batch_size(h0_95)
-    min_batch_size_9 = get_min_batch_size(h0_9)
-    min_batch_size_75 = get_min_batch_size(h0_75)
-
-    # Add vertical lines for each recall target where p < 0.05
-    if min_batch_size_99 is not None:
-        ax.axvline(x=min_batch_size_99, color = 'steelblue',linestyle='--', label='p < 0.05 (Recall 0.99)')
-    if min_batch_size_95 is not None:
-        ax.axvline(x=min_batch_size_95, color= 'orange', linestyle='--', label='p < 0.05 (Recall 0.95)')
-    if min_batch_size_9 is not None:
-        ax.axvline(x=min_batch_size_9, color= 'forestgreen', linestyle='--', label='p < 0.05 (Recall 0.90)')
-    if min_batch_size_75 is not None:
-        ax.axvline(x=min_batch_size_75, color= 'firebrick', linestyle='--', label='p < 0.05 (Recall 0.75)')
+    # Get the minimum batch size for the recall target
+    min_batch_size = get_min_batch_size(h0)
+    if min_batch_size is not None:
+        ax.axvline(x=min_batch_size, color = 'steelblue',linestyle='--', label=f'p < 0.05 (Recall {recall_target})')
 
     ax.set_xlabel('Documents screened')
     ax.set_ylabel('Relevant documents identified')
@@ -102,6 +80,11 @@ def plot_screeningprogress_with_stoppingpoints(seen_documents, df, n, dataset_na
 
     ax2.legend()
 
-    path = str(os.getcwd()) + "/" + "simulated-screening-curve-p-line-" + dataset_name + ".png"
+    path = str(os.getcwd()) + "/simulated_screening/" + dataset_name + "-" + str(recall_target) + "-2-v1_simulated-screening-curve-p-line-" + ".png"
     plt.savefig(path)
 
+plot_screeningprogress(df, seen_documents, title="Cumulative included documents", recall_target=RECALL_TARGET)
+plot_screeningprogress_with_stoppingpoints(df, seen_documents, recall_target=RECALL_TARGET, n=100)
+calculate_missed_includes(seen_df, df)
+calculate_true_recall(seen_df, df)
+calculate_work_savings(seen_df, df)
