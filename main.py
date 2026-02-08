@@ -69,22 +69,36 @@ def simulate_screening_random_sample(df_part, data_name): # dd: copy values to s
     N = int(max(100, min(0.1 * df_part.shape[0], 500)))
 
     # exclude datasets where we can't find enough included docs
-    for rs in range(1000):
+    
+    # Instead of drawing new samples, draw additional documents
+    rs = 42
+    idx = df_part.sample(n=N, random_state=rs).index
+    while (df_part.loc[idx, 'incl'].nunique() <= 1) & ((df_part.loc[idx, 'incl'] == 1).sum() <= 1):
+        N+=1
         idx = df_part.sample(n=N, random_state=rs).index
-        # check if more than one unique 'incl' value AND at least 2 docs where incl == 1
-        # fmh: this effectively excludes all dataset where either less than 2 docs have incl == 1 or all docs have incl == 1
-        if (df_part.loc[idx, 'incl'].nunique() > 1) & ((df_part.loc[idx, 'incl'] == 1).sum() > 1):
-            df_part.loc[idx, 'sim_seen'] = 1 # we have seen the random sample
-            df_part.loc[idx, 'sim_order'] = range(1, len(idx)+1) # we saw them in this order
-            random_sample = df_part.loc[idx]
-            print(f"Used random_state = {rs}")
-            break
-        else:
-            print("Couldn't find a sample withmore than one unique 'incl' value AND at least 2 docs where incl == 1.")
-    else:
-        # if we get here, no break occurred,no suitable sample found after 1000 tries
-        print(f"Skipping dataset {data_name} as no suitable sample found after 1000 attempts.")
-        return 0
+        if N >= df_part.shape[0]*0.5: 
+            print(f"Skipping dataset {data_name} as no suitable sample found after even with half the dataset sampled.")
+            return 0
+        
+    df_part.loc[idx, 'sim_seen'] = 1 # we have seen the random sample
+    df_part.loc[idx, 'sim_order'] = range(1, len(idx)+1) # we saw them in this order
+
+    # for rs in range(1000):
+    #     idx = df_part.sample(n=N, random_state=rs).index
+    #     # check if more than one unique 'incl' value AND at least 2 docs where incl == 1
+    #     # fmh: this effectively excludes all dataset where either less than 2 docs have incl == 1 or all docs have incl == 1
+    #     if (df_part.loc[idx, 'incl'].nunique() > 1) & ((df_part.loc[idx, 'incl'] == 1).sum() > 1):
+    #         df_part.loc[idx, 'sim_seen'] = 1 # we have seen the random sample
+    #         df_part.loc[idx, 'sim_order'] = range(1, len(idx)+1) # we saw them in this order
+    #         random_sample = df_part.loc[idx]
+    #         print(f"Used random_state = {rs}")
+    #         break
+    #     else:
+    #         print("Couldn't find a sample withmore than one unique 'incl' value AND at least 2 docs where incl == 1.")
+    # else:
+    #     # if we get here, no break occurred,no suitable sample found after 1000 tries
+    #     print(f"Skipping dataset {data_name} as no suitable sample found after 1000 attempts.")
+    #     return 0
 
     #df.loc[df.sample(n=N, random_state=50824).index, 'sim_seen'] = 1
     print(f"Documents screened: {df_part[df_part['sim_seen'] == 1]['sim_seen'].value_counts()[1]}")
@@ -120,7 +134,8 @@ def order_unseen_by_pred_relevance(df_part, x_train, n, sim_step, verbosity=0):
 
     # put these predictions in the "prediction" column of the dataframe
     # fmh: I think we do not need to store these predictions in the dataframe
-    #df_part.loc[unseen_index,'prediction'] = y_pred[:,1]
+    # MC: We do! so we can reorder later
+    df_part.loc[unseen_index,'prediction'] = y_pred[:,1]
     #pdf_part = df_part.loc[unseen_index].sort_values('prediction', ascending=False)
 
     # get an n batch with highest_predictions
@@ -434,12 +449,17 @@ def run_simulation_with_reordering(df, data_name, recall_target, col_name, verbo
                 # fmh: using calculate_h0 instead of retrospective
                 # dd: this is where we add reordering 
                 # rows where sim_order != 1: keep original order
-                mask = df_result['sim_order'] == 1
+                
+                # TODO: Let's consider whether we need to hold these constant 
+                # Actually, these don't have a prediction, so we should keep them at the front
+                # But not all sample docs have sim_order == 1
+                mask = (df_result['sim_order'] == 1 ) | (pd.isna(df_result['prediction']))
                 df_keep = df_result[mask]
 
                 # rows where sim_order != 1: sort by predicted relevance (scores from the model)
                 # dd: does this really work or do we have to add a full simulation level 2? 
-                df_sort = df_result[~mask].sort_values('prediction')
+                # Ah, this was supposed to be ascending = False!
+                df_sort = df_result[~mask].sort_values('prediction', ascending=False)
 
                 # combine: kept rows first (unchanged), then sorted rows
                 df_reordered = pd.concat([df_keep, df_sort], ignore_index=False)  
@@ -452,6 +472,7 @@ def run_simulation_with_reordering(df, data_name, recall_target, col_name, verbo
                 
                 # dd: does this still work as expected?
                 df_result.loc[current_batch_df.index, col_name] = p_val
+                df_result.loc[df_reordered.index, "sim_reordered"] = np.arange(df_reordered.shape[0])
 
                 if verbosity > 1:
                     print("sim step:", sim_step)
@@ -704,22 +725,50 @@ if __name__ == "__main__":
         # run through all simulations
         for d in iter_datasets():
 
-            df = pd.read_csv(f"synergy_datasets/{d.name}.csv")
+            df = pd.read_csv(f"synergy_dataset/{d.name}.csv")
             if df.shape[0] < 3000: #or df['incl'].sum()/df.shape[0] < 0.01:
                 continue
 
             for recall_target, col_name in zip(recall_targets,col_names):
 
+                # #prepare the directory and filename
+                # results_file = f"{d.name}-{recall_target}-results-{sim_type}.csv"
+                # results_folder = Path("simulated_screening")
+                # os.makedirs(results_folder,exist_ok=True)
+                # if (results_folder / results_file).exists():
+                #     print(f"Skipping {results_folder / results_file}—file already exists.")  
+                #     continue
+
+                # df = df.rename(columns={"label_included":"incl"})
+                # df_res = run_simulation(df.copy(), d.name, recall_target, col_name)
+
+                # df_res.to_csv(results_folder / results_file, index=False)
+                # print(f"saved a csv of simulated screening ({sim_type}) for dataset {d.name} (recall target: {recall_target})")
+
                 #prepare the directory and filename
                 results_file = f"{d.name}-{recall_target}-results-{sim_type}.csv"
-                results_folder = Path("simulated_screening")
+                results_folder = Path("simulated_screening_reordering")
                 os.makedirs(results_folder,exist_ok=True)
                 if (results_folder / results_file).exists():
                     print(f"Skipping {results_folder / results_file}—file already exists.")  
                     continue
 
                 df = df.rename(columns={"label_included":"incl"})
-                df_res = run_simulation(df, d.name, recall_target, col_name)
+                df_res = run_simulation_with_reordering(df.copy(), d.name, recall_target, col_name)
+
+                df_res.to_csv(results_folder / results_file, index=False)
+                print(f"saved a csv of simulated screening ({sim_type}) for dataset {d.name} (recall target: {recall_target})")
+
+                #prepare the directory and filename
+                results_file = f"{d.name}-{recall_target}-results-{sim_type}.csv"
+                results_folder = Path("simulated_screening_level2")
+                os.makedirs(results_folder,exist_ok=True)
+                if (results_folder / results_file).exists():
+                    print(f"Skipping {results_folder / results_file}—file already exists.")  
+                    continue
+
+                df = df.rename(columns={"label_included":"incl"})
+                df_res = run_simulation_with_level2(df.copy(), d.name, recall_target, col_name)
 
                 df_res.to_csv(results_folder / results_file, index=False)
                 print(f"saved a csv of simulated screening ({sim_type}) for dataset {d.name} (recall target: {recall_target})")
