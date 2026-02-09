@@ -731,6 +731,7 @@ if __name__ == "__main__":
 
             for recall_target, col_name in zip(recall_targets,col_names):
 
+                # MC: I just commented out this block for the time being to focus on the other bits.
                 # #prepare the directory and filename
                 # results_file = f"{d.name}-{recall_target}-results-{sim_type}.csv"
                 # results_folder = Path("simulated_screening")
