@@ -51,17 +51,14 @@ parameters = [
     }
 ]
 
-# 2. simulate ML-assisted prioritised screening for time *t*, *t+1*, and *t+2* without level 2 simulation
-# update 'sim_order'  based on the order we are screening the documents in (level 1 simulation)
-
 alpha = 0.05   # 1 - confidence level
 recall_targets = [0.99, 0.95, 0.9, 0.8,]
 col_names = ["buscar_p_r099", "buscar_p_r095", "buscar_p_r090", "buscar_p_r080"]
 
-
+# TODO: Let's consider whether we want to include a random sample in the beginning of each review update?
 # function to simulate the screening of the random sample in the beginning
 
-def simulate_screening_random_sample(df_part, data_name): # dd: copy values to sim_lev2_seen and sim_lev2_order for the random sample if sim_type > 1
+def simulate_screening_random_sample(df_part, data_name): 
     
     print("Simulate screening of an initial random set")
 
@@ -82,6 +79,7 @@ def simulate_screening_random_sample(df_part, data_name): # dd: copy values to s
         
     df_part.loc[idx, 'sim_seen'] = 1 # we have seen the random sample
     df_part.loc[idx, 'sim_order'] = range(1, len(idx)+1) # we saw them in this order
+
 
     # for rs in range(1000):
     #     idx = df_part.sample(n=N, random_state=rs).index
@@ -107,6 +105,7 @@ def simulate_screening_random_sample(df_part, data_name): # dd: copy values to s
 
     return df_part
 
+# function to order unseen documents by predicted relevance and "screen" the top n documents
 
 def order_unseen_by_pred_relevance(df_part, x_train, n, sim_step, verbosity=0):
     
@@ -136,7 +135,6 @@ def order_unseen_by_pred_relevance(df_part, x_train, n, sim_step, verbosity=0):
     # fmh: I think we do not need to store these predictions in the dataframe
     # MC: We do! so we can reorder later
     df_part.loc[unseen_index,'prediction'] = y_pred[:,1]
-    #pdf_part = df_part.loc[unseen_index].sort_values('prediction', ascending=False)
 
     # get an n batch with highest_predictions
     #print(np.argsort(np.array(y_pred[:,1]))[:n])
@@ -151,21 +149,23 @@ def order_unseen_by_pred_relevance(df_part, x_train, n, sim_step, verbosity=0):
     current_batch_df = df_part.loc[batch_idx]
     return df_part, current_batch_df
 
-def order_unseen_by_pred_relevance_lev2(df_part_lev2, x_train, n, sim_step_lev2, verbosity=0):
+# DD: not sure if we need this or can just add a conditional statement to the previous function
+def order_unseen_by_pred_relevance_lev2(df_part, x_train, n, sim_step_lev2, verbosity=0):
     
-    seen_index = df_part_lev2[df_part_lev2['sim_lev2_seen'] == 1].index 
-    # dd: we want to load values only for the random sample and then imitate normal ordering/screening
-    # dd: does this scale to further updates? there is probably a better way to record these values 
+    # DD: we want to load values only for the random sample and then imitate normal ordering/screening
+    # sim_lev2_seen == 1 only for the random sample
+    seen_index = df_part[df_part['sim_lev2_seen'] == 1].index 
     x_train_seen = x_train[seen_index]
-    unseen_index = df_part_lev2[df_part_lev2['sim_lev2_seen'] == 0].index
+    unseen_index = df_part[df_part['sim_lev2_seen'] == 0].index
     x_train_unseen = x_train[unseen_index]
 
     clf = SVC(C=0.25, probability=True, class_weight='balanced')
     # fmh: using standard values for SVM here
     start_time = time.time()
-    seen_df_part = df_part_lev2[df_part_lev2['sim_lev2_seen'] == 1]
+    seen_df_part = df_part[df_part['sim_lev2_seen'] == 1]
     clf.fit(x_train_seen, seen_df_part['incl'])
     elapsed_time = time.time() - start_time
+
     if verbosity > 1:
         print(f"used {len(seen_df_part)} seen docs for training")
         print(f"clf.fit took: {elapsed_time:.2f} seconds")
@@ -177,11 +177,6 @@ def order_unseen_by_pred_relevance_lev2(df_part_lev2, x_train, n, sim_step_lev2,
     if verbosity > 1:
         print(f"clf.predict_proba took: {elapsed_time:.2f} seconds")
 
-    # put these predictions in the "prediction" column of the dataframe
-    # fmh: I think we do not need to store these predictions in the dataframe
-    #df_part.loc[unseen_index,'prediction'] = y_pred[:,1]
-    #pdf_part = df_part.loc[unseen_index].sort_values('prediction', ascending=False)
-
     # get an n batch with highest_predictions
     #print(np.argsort(np.array(y_pred[:,1]))[:n])
     batch_idx = unseen_index.values[np.argsort(np.array(y_pred[:,1]))[::-1][:n]]  # this gets the indices that would order the prediction values and uses them to select the batch ids
@@ -190,11 +185,11 @@ def order_unseen_by_pred_relevance_lev2(df_part_lev2, x_train, n, sim_step_lev2,
         print(batch_idx[:10])
         print(y_pred[:,1][np.argsort(np.array(y_pred[:,1]))[::-1][:10]])
     
-    df_part_lev2.loc[batch_idx,'sim_lev2_seen'] = 1
-    df_part_lev2.loc[batch_idx, 'sim_lev2_order'] = range(sim_step_lev2+1, sim_step_lev2+len(batch_idx)+1)
-    current_batch_df_lev2 = df_part_lev2.loc[batch_idx]
-    return df_part_lev2, current_batch_df_lev2
-
+    # update these values directly in df_part, they will be reset before the next time
+    df_part.loc[batch_idx,'sim_lev2_seen'] = 1
+    df_part.loc[batch_idx, 'sim_lev2_order'] = range(sim_step_lev2+1, sim_step_lev2+len(batch_idx)+1)
+    current_batch_df_lev2 = df_part.loc[batch_idx]
+    return df_part, current_batch_df_lev2
 
 
 # main function to run a single simulation
@@ -253,6 +248,10 @@ def run_simulation(df, data_name, recall_target, col_name, verbosity=0):
         if current_review_update == 0:
 
             df_part = simulate_screening_random_sample(df_part, data_name)
+            
+            # DD: interrupt simulation and move on to next dataset if we couldn't find a random sample 
+            if isinstance(df_part, int):
+                raise TypeError("Skipping this dataset as no suitable random sample could be found.")
             df_result = df_part[df_part['sim_seen'] == 1].sort_values('sim_order')
             sim_step = len(df_result)
 
@@ -359,7 +358,6 @@ def run_simulation_with_reordering(df, data_name, recall_target, col_name, verbo
 
     df_result = pd.DataFrame() # this is where we'll be writing the results
 
-    # dd: this is where we add simulation level two
     # for current_review_update in range(1, max(df['review_update']+1))
  
     for current_review_update in range(0, max(df['review_update']+1)):
@@ -376,6 +374,9 @@ def run_simulation_with_reordering(df, data_name, recall_target, col_name, verbo
         if current_review_update == 0:
 
             df_part = simulate_screening_random_sample(df_part, data_name)
+            # DD: interrupt simulation and move on to next dataset if we couldn't find a random sample 
+            if isinstance(df_part, int):
+                raise TypeError("Skipping this dataset as no suitable random sample could be found.")
             df_result = df_part[df_part['sim_seen'] == 1].sort_values('sim_order')
             sim_step = len(df_result)
 
@@ -429,7 +430,6 @@ def run_simulation_with_reordering(df, data_name, recall_target, col_name, verbo
                 print("Recall at stopping:", recall)
                 print("Work saved:", df_part['sim_seen'].sum() / len(df_part))
         
-        # for the baseline review, find a random sample
         else:
 
             batch_size = int(max(100, min(0.1 * df_part.shape[0], 500)))
@@ -557,7 +557,15 @@ def run_simulation_with_level2(df, data_name, recall_target, col_name, verbosity
         # for the baseline review, find a random sample
         if current_review_update == 0:
 
-            df_part = simulate_screening_random_sample(df_part, data_name) # dd: add if sim_type > 1: sim_lev2_order add in the function?
+            df_part = simulate_screening_random_sample(df_part, data_name)
+
+            # DD: interrupt simulation and move on to next dataset if we couldn't find a random sample
+            if isinstance(df_part, int):
+                raise TypeError("Skipping this dataset as no suitable random sample could be found.")
+
+            # keep the random sample the same in level 2 simulation
+            df_part['sim_lev2_seen'] = df_part['sim_seen']
+            df_part['sim_lev2_order'] = df_part['sim_order']
             df_result = df_part[df_part['sim_seen'] == 1].sort_values('sim_order')
             sim_step = len(df_result)
 
@@ -611,6 +619,13 @@ def run_simulation_with_level2(df, data_name, recall_target, col_name, verbosity
             batch_size = int(max(100, min(0.1 * df_part.shape[0], 500)))
             print(f'Simulating stopping method with batch size = {batch_size}')
 
+            # keep the random sample the same in level 2 simulation
+            # TODO: copy sim_seen and sim_order for the random sample only
+            # TODO: fix KeyError: 'sim_order'
+            # 626-627, 647-649
+            df_part['sim_lev2_seen'] = df_part['sim_seen']
+            df_part['sim_lev2_order'] = df_part['sim_order']
+
             # simulate screening effort within this review update
             while df_result.shape[0] < x:
                 
@@ -627,17 +642,17 @@ def run_simulation_with_level2(df, data_name, recall_target, col_name, verbosity
                 df_result_lev2 = pd.DataFrame() # this is where we'll be writing the results of sim level 2
                 sim_step_lev2 = 0
                 
-                # dd: reset sim_lev2_seen and sim_lev_order every time apart from for the random sample
-                df_part_lev2 = df_part.copy()
-                # dd: do not reset these values for df_part.loc[idx] (random sample)
-                # dd: do not reset for documentIDs in random_sample
-                df_part_lev2['sim_lev2_seen'] = 0
-                df_part_lev2['sim_lev2_order'] = 0
+                # DD: reset sim_lev2_seen and sim_lev_order every time apart from for the random sample
+                # TODO: check this is working as intended
+                mask = (df_part['sim_order'] == 1) | (pd.isna(df_part['prediction']))
+                df_part['sim_lev2_seen'] = df_part['sim_lev2_seen'].mask(mask, 0)
+                df_part['sim_lev2_order'] = df_part['sim_lev2_order'].mask(mask, 0)
 
                 while df_result_lev2.shape[0] < x: 
 
-
-                    df_part_lev2, current_batch_df_lev2 = order_unseen_by_pred_relevance_lev2(df_part_lev2, x_train, batch_size, sim_step_lev2, verbosity=verbosity)
+                    # write screening results in sim_lev2_seen and sim_lev2_order
+                    # use existing values from df_part, where random sample has correct sim_lev2_seen and sim_lev2_order values
+                    df_part, current_batch_df_lev2 = order_unseen_by_pred_relevance_lev2(df_part, x_train, batch_size, sim_step_lev2, verbosity=verbosity)
                     sim_step_lev2 += len(current_batch_df_lev2)
                     # print("length of current batch:", len(current_batch_df))
                     print("current sim_step_lev2:", sim_step_lev2)
@@ -646,13 +661,16 @@ def run_simulation_with_level2(df, data_name, recall_target, col_name, verbosity
                 
                 # re-order documents by sim_lev2_order
                 # df_result = df_result.sort_values(by='sim_lev2_order')
-                p_val = calculate_h0(df_result_lev2['incl'], df_part_lev2.shape[0], recall_target=recall_target)
+                p_val = calculate_h0(df_result_lev2['incl'], df_part.shape[0], recall_target=recall_target)
 
-                if len(df_result_lev2) > len(df_part_lev2):
+                if len(df_result_lev2) > len(df_part):
                     print('something went wrong ...')
                     break
 
+                # TODO: check that this is working as intended 
                 df_result.loc[current_batch_df_lev2.index, col_name] = p_val
+                df_result.loc[current_batch_df_lev2.index, 'sim_lev2_seen'] = 1
+                df_result.loc[current_batch_df_lev2.index, 'sim_lev2_order'] = df_result_lev2.loc[current_batch_df_lev2.index, 'sim_lev2_order']
 
                 if verbosity > 1:
                     print("sim step:", sim_step)
@@ -663,12 +681,6 @@ def run_simulation_with_level2(df, data_name, recall_target, col_name, verbosity
                     print('reached p_value < 1 - confidence level')
                     break
 
-                # dd: write p_values, sim_lev2_seen, sim_lev2_order in df_part
-                # check that this works as expected
-                df_part.loc[current_batch_df_lev2.index, col_name] = p_val
-                df_part.loc[current_batch_df_lev2.index, 'sim_lev2_seen'] = 1
-                df_part.loc[current_batch_df_lev2.index, 'sim_lev2_order'] = df_result_lev2.loc[current_batch_df_lev2.index, 'sim_lev2_order']
-
             # write all recorded values in df
             
             df.update(df_part)
@@ -676,6 +688,7 @@ def run_simulation_with_level2(df, data_name, recall_target, col_name, verbosity
             # check recall
             # add the checks described above in here
             n_rel_seen = df_part[df_part['sim_seen'] == 1]['incl'].sum()
+            # TODO: check that this is working, returns different numbers of total includes somehow from run to run
             n_rel_tot = df_part['incl'].sum()
             recall = n_rel_seen / n_rel_tot
 
@@ -684,15 +697,15 @@ def run_simulation_with_level2(df, data_name, recall_target, col_name, verbosity
                 print("Recall at stopping:", recall)
                 print("Work saved:", df_part['sim_seen'].sum() / len(df_part))
 
-        # add all unseen data to results set
-        df_result = pd.concat([df_result, df[df['sim_seen'] == 0]]) # check
+    # add all unseen data to results set
+    df_result = pd.concat([df_result, df[df['sim_seen'] == 0]])
 
-        return df_result # check
+    return df_result
 
 if __name__ == "__main__":
 
-    testing = False
-    sim_type = '1' # '1', '2', '3'
+    testing = True
+    sim_type = '3' # '1', '2', '3'
     SIM_FUNCS = {
     1: run_simulation,
     2: run_simulation_with_reordering,
@@ -712,18 +725,19 @@ if __name__ == "__main__":
         df['publication_year'] = np.random.rand(len(df))
         df = df.rename(columns={"label_included":"incl"})
         
-        sim_time = time.time()    
-        df_res = run_simulation(df, dataset_name, recall_target, 'buscar_p_r080', verbosity=2)
+        sim_time = time.time()
+        sim_func = SIM_FUNCS[int(sim_type)]    
+        df_res = sim_func(df.copy(), dataset_name, recall_target, 'buscar_p_r080', verbosity=2)
         sim_time = time.time() - sim_time
 
         print(f"Simulation took: {sim_time:.2f} seconds")
 
         df_res.to_csv(results_folder / results_file, index=False)
-        print(f"saved a csv of simulated screening ({sim_type}) for dataset {dataset_name} (recall target: {recall_target})")
+        print(f"Saved a csv of simulated screening ({sim_type}) for dataset {dataset_name} (recall target: {recall_target})")
 
     else:
         # run through all simulations
-        for d in iter_datasets():
+        for d in iter_datasets(): # somehow, starts with Bos_2018 rather than Appenzeller-Herzog_2019
 
             df = pd.read_csv(f"synergy_dataset/{d.name}.csv")
             if df.shape[0] < 3000: #or df['incl'].sum()/df.shape[0] < 0.01:
@@ -755,24 +769,15 @@ if __name__ == "__main__":
                     continue
 
                 df = df.rename(columns={"label_included":"incl"})
-                df_res = run_simulation_with_reordering(df.copy(), d.name, recall_target, col_name)
 
-                df_res.to_csv(results_folder / results_file, index=False)
-                print(f"saved a csv of simulated screening ({sim_type}) for dataset {d.name} (recall target: {recall_target})")
-
-                #prepare the directory and filename
-                results_file = f"{d.name}-{recall_target}-results-{sim_type}.csv"
-                results_folder = Path("simulated_screening_level2")
-                os.makedirs(results_folder,exist_ok=True)
-                if (results_folder / results_file).exists():
-                    print(f"Skipping {results_folder / results_file}—file already exists.")  
+                # DD: add if returned 0, interrupt the simulation and move on to the next dataset
+                try: 
+                    sim_func = SIM_FUNCS[int(sim_type)] 
+                    df_res = sim_func(df.copy(), d.name, recall_target, col_name)
+                    df_res.to_csv(results_folder / results_file, index=False)
+                    print(f"saved a csv of simulated screening ({sim_type}) for dataset {d.name} (recall target: {recall_target})")
+                except TypeError:
+                    print(f"Skipping dataset {d.name} due to error in simulation.")
                     continue
-
-                df = df.rename(columns={"label_included":"incl"})
-                df_res = run_simulation_with_level2(df.copy(), d.name, recall_target, col_name)
-
-                df_res.to_csv(results_folder / results_file, index=False)
-                print(f"saved a csv of simulated screening ({sim_type}) for dataset {d.name} (recall target: {recall_target})")
-
 
         print('end of iteration over all datasets')
