@@ -64,12 +64,6 @@ class ScreeningDataset:
 class ScreeningSimulation():
     """
     A screening simulation run for a dataset and review.
-
-    Attributes
-    ----------
-    N : int
-        Total number of documents considered in this simulation.
-    
     """
 
     def __init__(
@@ -201,8 +195,16 @@ class ScreeningSimulation():
         
         return ordered_records
     
-    def prioritised_screening(
-            self):
+    def prioritised_screening(self):
+        """
+        Simulate prioritised screening on the dataset (up to current_review_update).
+
+        - train a model on seen data
+        - make predictions on unseen data 
+        - "screen" a batch of the data with the highest predictions
+        - calculate stopping criterion according to the simulation method
+        - stop screening when criterion says it is safe to do so 
+        """
         
         logger.info(
             f'Simulating stopping method with on dataset {self.dataset.name} with {self.N} documents available and batch size = {self.batch_size}. {self.documents_screened} screened already')
