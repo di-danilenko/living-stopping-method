@@ -27,10 +27,12 @@ class SimulationType(Enum):
 pd.set_option('display.max_columns', 20)
 
 N_UPDATES = 3
+BATCH_NUMBER = "batch_number"
+SIM_SEEN_IN_UPDATE = "sim_seen_in_update"
 
 logger.remove()
 # Set this to DEBUG to see more verbose output, or INFO to see less verbose
-#logger.add(sys.stderr, level="DEBUG")  
+# logger.add(sys.stderr, level="DEBUG")  
 logger.add(sys.stderr, level="INFO")  
 
 class ScreeningDataset:
@@ -52,14 +54,18 @@ class ScreeningDataset:
 
     def update(self, previous_step: pd.DataFrame):
         """Update the dataset with data from the previous screening step."""
+        logger.info(f"Before update {self.df.shape}")
         transfer_columns = [
             "sim_seen",
             "random_sample",
             "sim_order",
-            "prediction"
+            "prediction",
+            "p_score"
         ]
 
         self.df.loc[previous_step.index,transfer_columns] = previous_step[transfer_columns]
+        logger.info(f"After update {self.df.shape}")
+
 
 class ScreeningSimulation():
     """
@@ -85,7 +91,8 @@ class ScreeningSimulation():
         # Filter the dataset for this review update
         self.df = self._prepare_df(dataset.df, current_review_update)
         self.N = self.df.shape[0]
-        self.batch_size = int(max(100, min(0.1 * self.N, 500)))
+        self.batch_size = int(max(100, min(0.1 * self.dataset.df.shape[0], 500)))
+        self.batch_size = 200
         self.relevant_documents = self.df["incl"].sum()
 
     def _prepare_df(self, df: pd.DataFrame, current_update: int) -> pd.DataFrame:
@@ -131,6 +138,7 @@ class ScreeningSimulation():
         self.df.loc[idx, 'sim_seen'] = 1 # we have seen the random sample
         self.df.loc[idx, 'sim_order'] = list(range(1, len(idx)+1)) # we saw them in this order
         self.df.loc[idx, "random_sample"] = 1
+        self.df.loc[idx, SIM_SEEN_IN_UPDATE] = 0
 
         logger.info(f"Documents screened: {self.documents_screened}")
         logger.info(f"Relevant documents identified: {self.relevant_documents_found}")
@@ -139,7 +147,12 @@ class ScreeningSimulation():
         return True 
 
     def _fit_model(self, seen_index: pd.Index) -> SVC:
-        clf = SVC(C=0.25, probability=True, class_weight='balanced')
+        clf = SVC(
+            C=0.25, 
+            probability=True, 
+            class_weight='balanced',
+            random_state=self.run_id
+        )
         # fmh: using standard values for SVM here
         start_time = time.time()
         clf.fit(
@@ -165,7 +178,7 @@ class ScreeningSimulation():
     def _get_ordered_records(
             self, 
             baseline_sim: ScreeningSimulation | None  = None
-        ):
+        ) -> pd.DataFrame:
         """
         Get an ordered list of includes and excludes to pass to the stopping 
         criterion. This is dependent on the type of simulation.
@@ -174,14 +187,14 @@ class ScreeningSimulation():
             logger.debug("normal order")
             ordered_records = self.df[
                 (self.df["sim_seen"]==1)
-            ].sort_values("sim_order")["incl"].to_numpy()
+            ].sort_values("sim_order")
         elif self.simulation_type==SimulationType.REORDERING:
             logger.debug("Reordering in descending order of prediction")
             random_idx = self.df["random_sample"] == 1
             self.df.loc[random_idx, "prediction"] = 1.0
             ordered_records = self.df[
                 (self.df["sim_seen"]==1)
-            ].sort_values("prediction",ascending=False)["incl"].to_numpy()
+            ].sort_values("prediction", ascending=False)
         elif self.simulation_type==SimulationType.GAP_FILLING:
             if baseline_sim is None:
                 raise ValueError("No baseline sim supplied")
@@ -189,11 +202,14 @@ class ScreeningSimulation():
             self.df["level_2_order"] = baseline_sim.df["sim_order"]
             ordered_records = self.df[
                 (self.df["sim_seen"]==1)
-            ].sort_values("sim_order")["incl"].to_numpy()
+            ].sort_values("level_2_order")
         else:
             raise ValueError(f"Don't know how to order records when simulation type == {self.simulation_type}")
         
-        return ordered_records
+        ordered_records = ordered_records.reset_index(drop=True)
+        ordered_records["sim_reordered_order"] = np.arange(ordered_records.shape[0])
+        
+        return ordered_records.reset_index(drop=True)
     
     def prioritised_screening(self):
         """
@@ -207,7 +223,7 @@ class ScreeningSimulation():
         """
         
         logger.info(
-            f'Simulating stopping method with on dataset {self.dataset.name} with {self.N} documents available and batch size = {self.batch_size}. {self.documents_screened} screened already')
+            f'Simulating stopping method with simulation type {self.simulation_type} with on dataset {self.dataset.name} with {self.N} documents available and batch size = {self.batch_size}. {self.documents_screened} screened already')
         
         if self.simulation_type==SimulationType.GAP_FILLING and self.current_review_update>0:
             simulation_within_simulation = ScreeningSimulation(
@@ -240,11 +256,14 @@ class ScreeningSimulation():
                 self.documents_screened, self.documents_screened+batch_size
             ))
             self.df.loc[batch_idx,'sim_seen'] = 1
+            self.df.loc[batch_idx,SIM_SEEN_IN_UPDATE] = self.current_review_update
 
             ordered_records = self._get_ordered_records(baseline_sim=simulation_within_simulation)
 
+            self.save_interim_results("interim-screening-results", ordered_records)
+
             p_val = calculate_h0(
-                ordered_records,
+                ordered_records["incl"].to_numpy(),
                 self.N,
                 recall_target=self.recall_target
             )
@@ -273,7 +292,6 @@ class ScreeningSimulation():
         results_df = self.df.copy()
         results_df["dataset_name"] = self.dataset.name
         results_df["simulation_type"] = self.simulation_type.name
-        results_df["review_update"] = self.current_review_update
         results_df["run_id"] = self.run_id
 
         table = pa.Table.from_pandas(results_df)
@@ -283,10 +301,33 @@ class ScreeningSimulation():
             root_path=base_path,
             partition_cols=[
                 "dataset_name",
-                "simulation_type",
-                "review_update"
+                "simulation_type"
             ],
             existing_data_behavior="delete_matching"
+        )
+
+    def save_interim_results(self, base_path: str, ordered_records) -> None:
+        """Save interim results to file"""
+        interim_results = ordered_records.copy().drop(
+            columns=["p_score"]
+        )
+        interim_results["dataset_name"] = self.dataset.name
+        interim_results["simulation_type"] = self.simulation_type.name
+        interim_results["review_update"] = self.current_review_update
+        interim_results["run_id"] = self.run_id
+        interim_results[BATCH_NUMBER] = self.documents_screened
+
+        table = pa.Table.from_pandas(interim_results)
+
+        pq.write_to_dataset(
+            table,
+            root_path=base_path,
+            partition_cols=[
+                "dataset_name",
+                "simulation_type",
+                BATCH_NUMBER
+            ],
+            #existing_data_behavior="delete_matching"
         )
 
 def load_data(dataset_name: str):
@@ -299,7 +340,10 @@ def load_data(dataset_name: str):
         Path("synergy_dataset") / f"{dataset_name}.csv"
     )
     df["sim_seen"] = 0
+    df[SIM_SEEN_IN_UPDATE] = None
     df["random_sample"] = 0
+    df["p_score"] = None
+    df[BATCH_NUMBER] = None
     df['publication_year'] = np.random.rand(len(df))
     df = df.rename(columns={"label_included":"incl"})
     df['title'] = df['title'].apply(str)
@@ -337,10 +381,13 @@ def main(testing: bool):
     logger.info(f"Initialising living prioritised screening simulation with run_id {run_id}")
 
     if testing:
-        dataset_names = ["Wassenaar_2017"]
+        dataset_names = ["Appenzeller-Herzog_2019"]
         recall_targets = [0.8]
         alphas = [0.05]
-        simulation_types = [SimulationType.REORDERING]
+        simulation_types = [SimulationType.BASELINE]
+        # simulation_types = [SimulationType.BASELINE, SimulationType.REORDERING]
+        simulation_types = list(SimulationType)
+
     else:
         recall_targets = [0.99, 0.95, 0.9, 0.8]
         alphas = [0.05]
@@ -380,7 +427,9 @@ def main(testing: bool):
 
                         df = simulation.df
 
-                        simulation.save_results("screening_results/")
+
+                        if current_review_update == N_UPDATES-1:
+                            simulation.save_results("screening_results/")
 
 if __name__=="__main__":
     typer.run(main)
