@@ -128,6 +128,7 @@ class ScreeningSimulation():
         
         # Instead of drawing new samples, draw additional documents
         idx = self.df.sample(n=N, random_state=self.run_id).index
+        logger.info(f"RUN ID {self.run_id}")
         while (self.df.loc[idx, 'incl'].nunique() <= 1) & ((self.df.loc[idx, 'incl'] == 1).sum() <= 1):
             N+=1
             idx = self.df.sample(n=N, random_state=self.run_id).index
@@ -177,31 +178,32 @@ class ScreeningSimulation():
     
     def _get_ordered_records(
             self, 
-            baseline_sim: ScreeningSimulation | None  = None
+            inner_simulation: ScreeningSimulation | None  = None
         ) -> pd.DataFrame:
         """
         Get an ordered list of includes and excludes to pass to the stopping 
         criterion. This is dependent on the type of simulation.
         """
+        df = self.df.copy()
         if self.simulation_type==SimulationType.BASELINE or self.current_review_update==0:
             logger.debug("normal order")
-            ordered_records = self.df[
-                (self.df["sim_seen"]==1)
+            ordered_records = df[
+                (df["sim_seen"]==1)
             ].sort_values("sim_order")
         elif self.simulation_type==SimulationType.REORDERING:
             logger.debug("Reordering in descending order of prediction")
-            random_idx = self.df["random_sample"] == 1
-            self.df.loc[random_idx, "prediction"] = 1.0
-            ordered_records = self.df[
-                (self.df["sim_seen"]==1)
+            random_idx = df["random_sample"] == 1
+            df.loc[random_idx, "prediction"] = 1.0
+            ordered_records = df[
+                (df["sim_seen"]==1)
             ].sort_values("prediction", ascending=False)
         elif self.simulation_type==SimulationType.GAP_FILLING:
-            if baseline_sim is None:
+            if inner_simulation is None:
                 raise ValueError("No baseline sim supplied")
             logger.info("Reordering in descending order of prediction generated withing inner simulation")
-            self.df["level_2_order"] = baseline_sim.df["sim_order"]
-            ordered_records = self.df[
-                (self.df["sim_seen"]==1)
+            df["level_2_order"] = inner_simulation.df["sim_order"]
+            ordered_records = df[
+                (df["sim_seen"]==1)
             ].sort_values("level_2_order")
         else:
             raise ValueError(f"Don't know how to order records when simulation type == {self.simulation_type}")
@@ -258,7 +260,9 @@ class ScreeningSimulation():
             self.df.loc[batch_idx,'sim_seen'] = 1
             self.df.loc[batch_idx,SIM_SEEN_IN_UPDATE] = self.current_review_update
 
-            ordered_records = self._get_ordered_records(baseline_sim=simulation_within_simulation)
+            ordered_records = self._get_ordered_records(
+                inner_simulation=simulation_within_simulation
+            )
 
             self.save_interim_results("interim-screening-results", ordered_records)
 
@@ -381,7 +385,7 @@ def main(testing: bool):
     logger.info(f"Initialising living prioritised screening simulation with run_id {run_id}")
 
     if testing:
-        dataset_names = ["Appenzeller-Herzog_2019"]
+        dataset_names = ["Bos_2018"]
         recall_targets = [0.8]
         alphas = [0.05]
         simulation_types = [SimulationType.BASELINE]
@@ -409,6 +413,7 @@ def main(testing: bool):
 
                         if current_review_update > 0:
                             dataset.update(df)
+                            
 
                         simulation = ScreeningSimulation(
                             dataset=dataset,
@@ -419,7 +424,10 @@ def main(testing: bool):
                             run_id=run_id
                         )
                         if current_review_update==0:
+                            simulation.clear_dataset()
                             sample_success = simulation.simulate_sample()
+                            logger.info(f"{simulation.df["random_sample"].sum()}")
+                            return
                             if not sample_success:
                                 raise ValueError("Could not identify random sample")
 
