@@ -125,13 +125,16 @@ class ScreeningSimulation():
 
         # create a random sample (N = 10% df.shape[0] but min=250 and max=500)
         N = int(max(100, min(0.1 * self.df.shape[0], 500)))
+
+        rng = np.random.default_rng(seed=self.run_id)  # reproducible
+        shuffled_idx = rng.permutation(self.df.index.to_numpy())
         
         # Instead of drawing new samples, draw additional documents
-        idx = self.df.sample(n=N, random_state=self.run_id).index
+        idx = shuffled_idx[:N]
         logger.info(f"RUN ID {self.run_id}")
         while (self.df.loc[idx, 'incl'].nunique() <= 1) & ((self.df.loc[idx, 'incl'] == 1).sum() <= 1):
             N+=1
-            idx = self.df.sample(n=N, random_state=self.run_id).index
+            idx = shuffled_idx[:N]
             if N >= self.df.shape[0]*0.5: 
                 logger.warning(f"Skipping dataset {self.dataset.name} as no suitable sample found after even with half the dataset sampled.")
                 return False
@@ -348,6 +351,7 @@ def load_data(dataset_name: str):
     df["random_sample"] = 0
     df["p_score"] = None
     df[BATCH_NUMBER] = None
+    np.random.seed(42)
     df['publication_year'] = np.random.rand(len(df))
     df = df.rename(columns={"label_included":"incl"})
     df['title'] = df['title'].apply(str)
