@@ -18,6 +18,7 @@ from loguru import logger
 import sys
 import pyarrow as pa
 import pyarrow.parquet as pq
+from copy import deepcopy
 
 class SimulationType(Enum):
     BASELINE = 1
@@ -189,12 +190,12 @@ class ScreeningSimulation():
         """
         df = self.df.copy()
         if self.simulation_type==SimulationType.BASELINE or self.current_review_update==0:
-            logger.debug("normal order")
+            logger.info("normal order")
             ordered_records = df[
                 (df["sim_seen"]==1)
             ].sort_values("sim_order")
         elif self.simulation_type==SimulationType.REORDERING:
-            logger.debug("Reordering in descending order of prediction")
+            logger.info("Reordering in descending order of prediction")
             random_idx = df["random_sample"] == 1
             df.loc[random_idx, "prediction"] = 1.0
             ordered_records = df[
@@ -228,11 +229,11 @@ class ScreeningSimulation():
         """
         
         logger.info(
-            f'Simulating stopping method with simulation type {self.simulation_type} with on dataset {self.dataset.name} with {self.N} documents available and batch size = {self.batch_size}. {self.documents_screened} screened already')
+            f'Simulating stopping method with simulation type {self.simulation_type} on dataset {self.dataset.name} with {self.N} documents available, batch size = {self.batch_size}, and recall target = {self.recall_target}. {self.documents_screened} screened already.')
         
         if self.simulation_type==SimulationType.GAP_FILLING and self.current_review_update>0:
             simulation_within_simulation = ScreeningSimulation(
-                dataset=self.dataset,
+                dataset=deepcopy(self.dataset),
                 current_review_update=self.current_review_update,
                 simulation_type=SimulationType.BASELINE,
                 recall_target=self.recall_target,
@@ -254,7 +255,7 @@ class ScreeningSimulation():
 
             batch_size = min(self.batch_size, y_pred.shape[0])
 
-            top_idx = np.argpartition(-y_pred, batch_size - 1)[:batch_size]
+            top_idx = np.argpartition(-y_pred, batch_size - 1)[:batch_size] # does this mess with the simulated screening where it would be in truly descending order (argsort)
             batch_idx = unseen_index[top_idx]
 
             self.df.loc[batch_idx, 'sim_order'] = list(range(
@@ -268,6 +269,7 @@ class ScreeningSimulation():
             )
 
             self.save_interim_results("interim-screening-results", ordered_records)
+            logger.info(f"Calculating p-value for {len(ordered_records)}, {self.N}")
 
             p_val = calculate_h0(
                 ordered_records["incl"].to_numpy(),
@@ -276,6 +278,7 @@ class ScreeningSimulation():
             )
 
             self.df.loc[batch_idx[-1], "p_score"] = p_val
+            logger.info(f"Lowest p-value was {p_val} at index {batch_idx[-1]}")
 
             if p_val < self.alpha:
                 logger.info(
@@ -351,8 +354,8 @@ def load_data(dataset_name: str):
     df["random_sample"] = 0
     df["p_score"] = None
     df[BATCH_NUMBER] = None
-    np.random.seed(42)
-    df['publication_year'] = np.random.rand(len(df))
+    #np.random.seed(42)
+    #df['publication_year'] = np.random.rand(len(df))
     df = df.rename(columns={"label_included":"incl"})
     df['title'] = df['title'].apply(str)
     df['abstract'] = df['abstract'].apply(str)
@@ -389,12 +392,13 @@ def main(testing: bool):
     logger.info(f"Initialising living prioritised screening simulation with run_id {run_id}")
 
     if testing:
-        dataset_names = ["Bos_2018"]
+        dataset_names = ["Hall_2012"]
         recall_targets = [0.8]
         alphas = [0.05]
-        simulation_types = [SimulationType.BASELINE]
-        # simulation_types = [SimulationType.BASELINE, SimulationType.REORDERING]
+        #simulation_types = [SimulationType.BASELINE]
+        #simulation_types = [SimulationType.GAP_FILLING]
         simulation_types = list(SimulationType)
+        #simulation_types = [SimulationType.BASELINE, SimulationType.REORDERING]
 
     else:
         recall_targets = [0.99, 0.95, 0.9, 0.8]
@@ -404,23 +408,27 @@ def main(testing: bool):
 
     for dataset_name in dataset_names:
 
-        df = load_data(dataset_name)
-
-        dataset = ScreeningDataset(df=df, name=dataset_name)
-        dataset.vectorise()
 
         for recall_target in recall_targets:
             for alpha in alphas:
                 for simulation_level in simulation_types:
-                    for current_review_update in range(N_UPDATES):
-                        logger.info(f"Update: {current_review_update}")
 
+                    df = load_data(dataset_name)
+
+                    dataset = ScreeningDataset(df=df, name=dataset_name)
+                    dataset.vectorise()
+                    for current_review_update in range(N_UPDATES):
+
+
+                        
+                        logger.info(f"Update: {current_review_update}")
+                        
                         if current_review_update > 0:
                             dataset.update(df)
                             
 
                         simulation = ScreeningSimulation(
-                            dataset=dataset,
+                            dataset=deepcopy(dataset),
                             current_review_update=current_review_update,
                             simulation_type=simulation_level,
                             recall_target=recall_target,
@@ -431,7 +439,7 @@ def main(testing: bool):
                             simulation.clear_dataset()
                             sample_success = simulation.simulate_sample()
                             logger.info(f"{simulation.df["random_sample"].sum()}")
-                            return
+                            
                             if not sample_success:
                                 raise ValueError("Could not identify random sample")
 
@@ -439,9 +447,11 @@ def main(testing: bool):
 
                         df = simulation.df
 
-
                         if current_review_update == N_UPDATES-1:
                             simulation.save_results("screening_results/")
 
 if __name__=="__main__":
     typer.run(main)
+
+# TODO: add recall target when saving simulation results
+# TODO: figure out what's wrong with the first update in REORDERING and GAPFILLING
