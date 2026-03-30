@@ -304,6 +304,7 @@ class ScreeningSimulation():
         results_df["simulation_type"] = self.simulation_type.name
         results_df["run_id"] = self.run_id
         results_df["recall_target"] = self.recall_target
+        results_df["alpha"] = self.alpha
 
         table = pa.Table.from_pandas(results_df)
 
@@ -327,6 +328,7 @@ class ScreeningSimulation():
         interim_results["review_update"] = self.current_review_update
         interim_results["run_id"] = self.run_id
         interim_results["recall_target"] = self.recall_target
+        interim_results["alpha"] = self.alpha
         interim_results[BATCH_NUMBER] = self.documents_screened
 
         table = pa.Table.from_pandas(interim_results)
@@ -401,7 +403,7 @@ def main(testing: bool):
 
     else:
         recall_targets = [0.99, 0.95, 0.9, 0.8]
-        alphas = [0.05]
+        alphas = [0.01,0.05,0.10]
         dataset_names = [d.name for d in iter_datasets()]
         simulation_types = list(SimulationType)
 
@@ -452,3 +454,4 @@ def main(testing: bool):
 if __name__=="__main__":
     typer.run(main)
 
+# TODO: add skip if the combination of settings has already been simulated
