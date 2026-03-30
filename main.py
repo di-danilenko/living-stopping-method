@@ -313,7 +313,10 @@ class ScreeningSimulation():
             root_path=base_path,
             partition_cols=[
                 "dataset_name",
-                "simulation_type"
+                "simulation_type",
+                "recall_target",
+                "alpha",
+                "run_id"
             ],
             existing_data_behavior="delete_matching"
         )
@@ -339,6 +342,9 @@ class ScreeningSimulation():
             partition_cols=[
                 "dataset_name",
                 "simulation_type",
+                "recall_target",
+                "alpha",
+                "run_id",
                 BATCH_NUMBER
             ],
             #existing_data_behavior="delete_matching"
