@@ -268,7 +268,7 @@ class ScreeningSimulation():
                 inner_simulation=simulation_within_simulation
             )
 
-            self.save_interim_results("interim-screening-results", ordered_records)
+            #self.save_interim_results("interim-screening-results", ordered_records)
             logger.info(f"Calculating p-value for {len(ordered_records)}, {self.N}")
 
             p_val = calculate_h0(
@@ -313,10 +313,7 @@ class ScreeningSimulation():
             root_path=base_path,
             partition_cols=[
                 "dataset_name",
-                "simulation_type",
-                "recall_target",
-                "alpha",
-                "run_id"
+                "simulation_type"
             ],
             existing_data_behavior="delete_matching"
         )
@@ -342,9 +339,6 @@ class ScreeningSimulation():
             partition_cols=[
                 "dataset_name",
                 "simulation_type",
-                "recall_target",
-                "alpha",
-                "run_id",
                 BATCH_NUMBER
             ],
             #existing_data_behavior="delete_matching"
@@ -395,69 +389,70 @@ def get_run_id() -> int:
     except KeyError:
         return 1
 
-def main(testing: bool):
+class SampleError(Exception):
+    pass
+
+def main(testing: bool = True, workdir: str= "screening_results/"):
 
     run_id = get_run_id()
 
     logger.info(f"Initialising living prioritised screening simulation with run_id {run_id}")
 
     if testing:
-        dataset_names = ["Hall_2012"]
-        recall_targets = [0.8]
-        alphas = [0.05]
+        dataset_names = ["Brouwer_2019"]
+        recall_targets = [0.99, 0.95, 0.9, 0.8]
+        alphas = [0.05,0.10]
         simulation_types = list(SimulationType)
 
     else:
-        recall_targets = [0.99, 0.95, 0.9, 0.8]
-        alphas = [0.01,0.05,0.10]
+        recall_targets = [0.99, 0.95, 0.9, 0.8] 
+        alphas = [0.05,0.10] 
         dataset_names = [d.name for d in iter_datasets()]
         simulation_types = list(SimulationType)
 
     for dataset_name in dataset_names:
+        try:
+            for recall_target in recall_targets:
+                for alpha in alphas:
+                    for simulation_level in simulation_types:
 
+                        df = load_data(dataset_name)
 
-        for recall_target in recall_targets:
-            for alpha in alphas:
-                for simulation_level in simulation_types:
-
-                    df = load_data(dataset_name)
-
-                    dataset = ScreeningDataset(df=df, name=dataset_name)
-                    dataset.vectorise()
-                    for current_review_update in range(N_UPDATES):
-
-
-                        
-                        logger.info(f"Update: {current_review_update}")
-                        
-                        if current_review_update > 0:
-                            dataset.update(df)
+                        dataset = ScreeningDataset(df=df, name=dataset_name)
+                        dataset.vectorise()
+                        for current_review_update in range(N_UPDATES):
                             
-
-                        simulation = ScreeningSimulation(
-                            dataset=deepcopy(dataset),
-                            current_review_update=current_review_update,
-                            simulation_type=simulation_level,
-                            recall_target=recall_target,
-                            alpha=alpha,
-                            run_id=run_id
-                        )
-                        if current_review_update==0:
-                            simulation.clear_dataset()
-                            sample_success = simulation.simulate_sample()
-                            logger.info(f"{simulation.df["random_sample"].sum()}")
+                            logger.info(f"Update: {current_review_update}")
                             
-                            if not sample_success:
-                                raise ValueError("Could not identify random sample")
+                            if current_review_update > 0:
+                                dataset.update(df)
+                                
 
-                        simulation.prioritised_screening()
+                            simulation = ScreeningSimulation(
+                                dataset=deepcopy(dataset),
+                                current_review_update=current_review_update,
+                                simulation_type=simulation_level,
+                                recall_target=recall_target,
+                                alpha=alpha,
+                                run_id=run_id
+                            )
+                            if current_review_update==0:
+                                simulation.clear_dataset()
+                                sample_success = simulation.simulate_sample()
+                                logger.info(f"{simulation.df["random_sample"].sum()}")
+                                
+                                if not sample_success:
+                                    raise SampleError("Could not identify random sample") 
+                                
+                            simulation.prioritised_screening()
 
-                        df = simulation.df
+                            df = simulation.df
 
-                        if current_review_update == N_UPDATES-1:
-                            simulation.save_results("screening_results/")
+                            if current_review_update == N_UPDATES-1:
+                                simulation.save_results(f"{workdir}/screening_results/")
+        except SampleError as e:
+            logger.info(str(e))
+            continue
 
 if __name__=="__main__":
     typer.run(main)
-
-# TODO: add skip if the combination of settings has already been simulated

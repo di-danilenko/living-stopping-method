@@ -3,7 +3,7 @@ name = "living-stopping-method"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "buscarpy==0.0.2",
     "certifi==2025.10.5",
@@ -12,6 +12,7 @@ dependencies = [
     "cycler==0.12.1",
     "fonttools==4.60.1",
     "idna==3.11",
+    "ipykernel>=7.2.0",
     "joblib==1.5.2",
     "jupyter>=1.1.1",
     "kiwisolver==1.4.9",

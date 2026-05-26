@@ -1,6 +1,5 @@
 ### TO-DO ###
 # check how we handle the multiple iterations in the simulated screening results (i.e. seen in iteration 1-3, p-value, etc.)
-# add a loop for dataset, review iteration, recall target, confidence level, random state
 # add a dynamic review iteration trigger instead of a fixed number of reviews for all datasets
 # add reordering based on predictions from the model (experiment 3)
 
