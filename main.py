@@ -61,7 +61,8 @@ class ScreeningDataset:
             "random_sample",
             "sim_order",
             "prediction",
-            "p_score"
+            "p_score",
+            SIM_SEEN_IN_UPDATE
         ]
 
         self.df.loc[previous_step.index,transfer_columns] = previous_step[transfer_columns]
@@ -313,7 +314,9 @@ class ScreeningSimulation():
             root_path=base_path,
             partition_cols=[
                 "dataset_name",
-                "simulation_type"
+                "simulation_type",
+                "alpa",
+                "recall_target"
             ],
             existing_data_behavior="delete_matching"
         )
@@ -399,7 +402,7 @@ def main(testing: bool = True, workdir: str= "screening_results/"):
     logger.info(f"Initialising living prioritised screening simulation with run_id {run_id}")
 
     if testing:
-        dataset_names = ["Brouwer_2019"]
+        dataset_names = ["Hall_2012"]
         recall_targets = [0.99, 0.95, 0.9, 0.8]
         alphas = [0.05,0.10]
         simulation_types = list(SimulationType)
