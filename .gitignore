@@ -7,3 +7,5 @@ screening_results/
 interim-screening-results/
 __pycache__/
 graphs/
+logs/
+job.sh

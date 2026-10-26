@@ -61,7 +61,8 @@ class ScreeningDataset:
             "random_sample",
             "sim_order",
             "prediction",
-            "p_score"
+            "p_score",
+            SIM_SEEN_IN_UPDATE
         ]
 
         self.df.loc[previous_step.index,transfer_columns] = previous_step[transfer_columns]
@@ -268,7 +269,7 @@ class ScreeningSimulation():
                 inner_simulation=simulation_within_simulation
             )
 
-            self.save_interim_results("interim-screening-results", ordered_records)
+            #self.save_interim_results("interim-screening-results", ordered_records)
             logger.info(f"Calculating p-value for {len(ordered_records)}, {self.N}")
 
             p_val = calculate_h0(
@@ -313,7 +314,9 @@ class ScreeningSimulation():
             root_path=base_path,
             partition_cols=[
                 "dataset_name",
-                "simulation_type"
+                "simulation_type",
+                "alpa",
+                "recall_target"
             ],
             existing_data_behavior="delete_matching"
         )
@@ -422,6 +425,7 @@ def main(testing: bool = False, workdir: str= "screening_results/"):
                         dataset.vectorise()
                         for current_review_update in range(N_UPDATES):
 
+                        df = load_data(dataset_name)
 
                             
                             logger.info(f"Update: {current_review_update}")
