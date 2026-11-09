@@ -1,2 +1,11 @@
 synergy_dataset/
 simulated_screening/
+simulated_screening_reordering/
+simulated_screening_level2/
+.ipynb_checkpoints/
+screening_results/
+interim-screening-results/
+__pycache__/
+graphs/
+logs/
+job.sh

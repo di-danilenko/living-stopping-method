@@ -1,728 +1,463 @@
 # load all packages
+from __future__ import annotations
 import pandas as pd
 from synergy_dataset import iter_datasets
-import matplotlib.pyplot as plt
 import os
 from buscarpy import calculate_h0
-import timeit
 import time
 import numpy as np
 from pathlib import Path
+# add the model specification
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.svm import SVC
+import typer
+from enum import Enum
+from scipy.sparse import csr_matrix
+from typing import cast
+from loguru import logger
+import sys
+import pyarrow as pa
+import pyarrow.parquet as pq
+from copy import deepcopy
+
+class SimulationType(Enum):
+    BASELINE = 1
+    REORDERING = 2
+    GAP_FILLING = 3
 
 pd.set_option('display.max_columns', 20)
 
-# add the model specification
-from sklearn.pipeline import Pipeline
-from sklearn.model_selection import GridSearchCV
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.svm import SVC
-from sklearn.exceptions import UndefinedMetricWarning
+N_UPDATES = 3
+BATCH_NUMBER = "batch_number"
+SIM_SEEN_IN_UPDATE = "sim_seen_in_update"
 
-def assign_batch(order,n):
-    # Batch sizes of n increment, adjust as needed
-    return ((order) // n + 1) * n
+logger.remove()
+# Set this to DEBUG to see more verbose output, or INFO to see less verbose
+# logger.add(sys.stderr, level="DEBUG")  
+logger.add(sys.stderr, level="INFO")  
 
-# here we define the whole ML pipeline starting from creating features to training a classifier
-pipeline = Pipeline([
-    ('vect', TfidfVectorizer()),
-    ('clf', SVC(probability=True,  class_weight="balanced")),
-])
+class ScreeningDataset:
+    def __init__(
+            self,
+            df: pd.DataFrame,
+            name: str,
+            vectorizer_params: dict | None = None,
+    ):
+        self.df = df.copy()
+        self.vectorizer = TfidfVectorizer(**(vectorizer_params or {}))
+        self.name = name
 
-# now we define the parameter space we want to search. This gets computationally expensive the
-# more parameters we search, as we fit a model for every unique combination of parameters (there are fancier and smarter ways to do this)
-# decreased the number of parameters to simplify computation
+    def vectorise(self):
+        """
+        Fit the vectorise on the dataset, and set dataset.x_train.
+        """
+        self.x_train = cast(csr_matrix, self.vectorizer.fit_transform(self.df["texts"]))
 
-parameters = [
-    {
-        'vect__max_df': (0.5, 0.75, 1.0),
-        'vect__min_df': (5, 10, 15),
-        'vect__ngram_range': ((1, 1), (1, 2)),
-        'clf__kernel': ['rbf'],
-        # because only the rbf kernel has the gamma parameters, we do this separately
-        'clf__gamma': [1e-3, 1e-4], 
-        'clf__C': [1, 1e1, 1e2]
-    },
-    {
-        'vect__max_df': (0.5,),
-        'vect__min_df': (5, 10, 15),
-        'vect__ngram_range': ((1, 1), (1, 2)),
-        'clf__kernel': ['linear'],
-        'clf__C': [1e2, 1e3]
-    }
-]
+    def update(self, previous_step: pd.DataFrame):
+        """Update the dataset with data from the previous screening step."""
+        logger.info(f"Before update {self.df.shape}")
+        transfer_columns = [
+            "sim_seen",
+            "random_sample",
+            "sim_order",
+            "prediction",
+            "p_score",
+            SIM_SEEN_IN_UPDATE
+        ]
 
-# 2. simulate ML-assisted prioritised screening for time *t*, *t+1*, and *t+2* without level 2 simulation
-# update 'sim_order'  based on the order we are screening the documents in (level 1 simulation)
-
-alpha = 0.05   # 1 - confidence level
-recall_targets = [0.99, 0.95, 0.9, 0.8,]
-col_names = ["buscar_p_r099", "buscar_p_r095", "buscar_p_r090", "buscar_p_r080"]
+        self.df.loc[previous_step.index,transfer_columns] = previous_step[transfer_columns]
+        logger.info(f"After update {self.df.shape}")
 
 
-# function to simulate the screening of the random sample in the beginning
+class ScreeningSimulation():
+    """
+    A screening simulation run for a dataset and review.
+    """
 
-def simulate_screening_random_sample(df_part, data_name): # dd: copy values to sim_lev2_seen and sim_lev2_order for the random sample if sim_type > 1
+    def __init__(
+            self,
+            dataset: ScreeningDataset,
+            current_review_update: int,
+            simulation_type: SimulationType,
+            recall_target: float,
+            alpha: float,
+            run_id: int
+    ):
+        self.dataset = dataset
+        self.current_review_update = current_review_update
+        self.simulation_type = simulation_type
+        self.recall_target = recall_target
+        self.alpha = alpha
+        self.run_id = run_id
+
+        # Filter the dataset for this review update
+        self.df = self._prepare_df(dataset.df, current_review_update)
+        self.N = self.df.shape[0]
+        self.batch_size = int(max(100, min(0.1 * self.dataset.df.shape[0], 500)))
+        self.batch_size = 200
+        self.relevant_documents = self.df["incl"].sum()
+
+    def _prepare_df(self, df: pd.DataFrame, current_update: int) -> pd.DataFrame:
+        """Return a copy of the dataset filtered by review_update."""
+        df_copy = df.copy()
+        return df_copy[df_copy["review_update"] <= current_update]
+
+    @property
+    def documents_screened(self) -> int:
+        return (self.df['sim_seen'] == 1).sum()
     
-    print("Simulate screening of an initial random set")
+    @property
+    def relevant_documents_found(self) -> int:
+        return self.df[self.df['sim_seen'] == 1]['incl'].sum()
+    
+    @property
+    def prevalence(self) -> float:
+        return self.relevant_documents_found / self.documents_screened
+    
+    @property
+    def recall(self) -> float:
+        return self.relevant_documents_found / self.relevant_documents
+    
+    @property
+    def prop_screened(self) -> float:
+        return self.documents_screened / self.N
 
-    # create a random sample (N = 10% df.shape[0] but min=250 and max=500)
-    N = int(max(100, min(0.1 * df_part.shape[0], 500)))
+    def simulate_sample(self) -> bool:
+        logger.info("Simulate screening of an initial random set")
 
-    # exclude datasets where we can't find enough included docs
-    for rs in range(1000):
-        idx = df_part.sample(n=N, random_state=rs).index
-        # check if more than one unique 'incl' value AND at least 2 docs where incl == 1
-        # fmh: this effectively excludes all dataset where either less than 2 docs have incl == 1 or all docs have incl == 1
-        if (df_part.loc[idx, 'incl'].nunique() > 1) & ((df_part.loc[idx, 'incl'] == 1).sum() > 1):
-            df_part.loc[idx, 'sim_seen'] = 1 # we have seen the random sample
-            df_part.loc[idx, 'sim_order'] = range(1, len(idx)+1) # we saw them in this order
-            random_sample = df_part.loc[idx]
-            print(f"Used random_state = {rs}")
-            break
+        # create a random sample (N = 10% df.shape[0] but min=250 and max=500)
+        N = int(max(100, min(0.1 * self.df.shape[0], 500)))
+
+        rng = np.random.default_rng(seed=self.run_id)  # reproducible
+        shuffled_idx = rng.permutation(self.df.index.to_numpy())
+        
+        # Instead of drawing new samples, draw additional documents
+        idx = shuffled_idx[:N]
+        logger.info(f"RUN ID {self.run_id}")
+        while (self.df.loc[idx, 'incl'].nunique() <= 1) & ((self.df.loc[idx, 'incl'] == 1).sum() <= 1):
+            N+=1
+            idx = shuffled_idx[:N]
+            if N >= self.df.shape[0]*0.5: 
+                logger.warning(f"Skipping dataset {self.dataset.name} as no suitable sample found after even with half the dataset sampled.")
+                return False
+            
+        self.df.loc[idx, 'sim_seen'] = 1 # we have seen the random sample
+        self.df.loc[idx, 'sim_order'] = list(range(1, len(idx)+1)) # we saw them in this order
+        self.df.loc[idx, "random_sample"] = 1
+        self.df.loc[idx, SIM_SEEN_IN_UPDATE] = 0
+
+        logger.info(f"Documents screened: {self.documents_screened}")
+        logger.info(f"Relevant documents identified: {self.relevant_documents_found}")
+        logger.info(f"Relevance rate across the dataset: {self.prevalence}")   
+
+        return True 
+
+    def _fit_model(self, seen_index: pd.Index) -> SVC:
+        clf = SVC(
+            C=0.25, 
+            probability=True, 
+            class_weight='balanced',
+            random_state=self.run_id
+        )
+        # fmh: using standard values for SVM here
+        start_time = time.time()
+        clf.fit(
+            self.dataset.x_train[seen_index], 
+            self.df.loc[seen_index, 'incl']
+        )
+        elapsed_time = time.time() - start_time
+
+        logger.debug(f"used {seen_index.shape} seen docs for training")
+        logger.debug(f"clf.fit took: {elapsed_time:.2f} seconds")
+        return clf
+    
+    def _make_predictions(self, clf: SVC, unseen_index: pd.Index):
+        start_time = time.time()
+        y_pred = clf.predict_proba(self.dataset.x_train[unseen_index])[:,1]
+        elapsed_time = time.time() - start_time
+        
+        logger.debug(f"clf.predict_proba took: {elapsed_time:.2f} seconds")
+
+        self.df.loc[unseen_index,"prediction"] = y_pred
+        return y_pred
+    
+    def _get_ordered_records(
+            self, 
+            inner_simulation: ScreeningSimulation | None  = None
+        ) -> pd.DataFrame:
+        """
+        Get an ordered list of includes and excludes to pass to the stopping 
+        criterion. This is dependent on the type of simulation.
+        """
+        df = self.df.copy()
+        if self.simulation_type==SimulationType.BASELINE or self.current_review_update==0:
+            logger.info("normal order")
+            ordered_records = df[
+                (df["sim_seen"]==1)
+            ].sort_values("sim_order")
+        elif self.simulation_type==SimulationType.REORDERING:
+            logger.info("Reordering in descending order of prediction")
+            random_idx = df["random_sample"] == 1
+            df.loc[random_idx, "prediction"] = 1.0
+            ordered_records = df[
+                (df["sim_seen"]==1)
+            ].sort_values("prediction", ascending=False)
+        elif self.simulation_type==SimulationType.GAP_FILLING:
+            if inner_simulation is None:
+                raise ValueError("No baseline sim supplied")
+            logger.info("Reordering in descending order of prediction generated withing inner simulation")
+            df["level_2_order"] = inner_simulation.df["sim_order"]
+            ordered_records = df[
+                (df["sim_seen"]==1)
+            ].sort_values("level_2_order")
         else:
-            print("Couldn't find a sample withmore than one unique 'incl' value AND at least 2 docs where incl == 1.")
-    else:
-        # if we get here, no break occurred,no suitable sample found after 1000 tries
-        print(f"Skipping dataset {data_name} as no suitable sample found after 1000 attempts.")
-        return 0
-
-    #df.loc[df.sample(n=N, random_state=50824).index, 'sim_seen'] = 1
-    print(f"Documents screened: {df_part[df_part['sim_seen'] == 1]['sim_seen'].value_counts()[1]}")
-    print(f"Relevant documents identified: {df_part[df_part['sim_seen'] == 1]['incl'].sum()}")
-    print(f"Relevance rate across the dataset: {df_part[df_part['sim_seen'] == 1]['incl'].sum()/len(df_part[df_part['sim_seen'] == 1]['incl'])}")
-
-    return df_part
-
-
-def order_unseen_by_pred_relevance(df_part, x_train, n, sim_step, verbosity=0):
+            raise ValueError(f"Don't know how to order records when simulation type == {self.simulation_type}")
+        
+        ordered_records = ordered_records.reset_index(drop=True)
+        ordered_records["sim_reordered_order"] = np.arange(ordered_records.shape[0])
+        
+        return ordered_records.reset_index(drop=True)
     
-    seen_index = df_part[df_part['sim_seen'] == 1].index
-    x_train_seen = x_train[seen_index]
-    unseen_index = df_part[df_part['sim_seen'] == 0].index
-    x_train_unseen = x_train[unseen_index]
+    def prioritised_screening(self):
+        """
+        Simulate prioritised screening on the dataset (up to current_review_update).
 
-    clf = SVC(C=0.25, probability=True, class_weight='balanced')
-    # fmh: using standard values for SVM here
-    start_time = time.time()
-    seen_df_part = df_part[df_part['sim_seen'] == 1]
-    clf.fit(x_train_seen, seen_df_part['incl'])
-    elapsed_time = time.time() - start_time
-    if verbosity > 1:
-        print(f"used {len(seen_df_part)} seen docs for training")
-        print(f"clf.fit took: {elapsed_time:.2f} seconds")
+        - train a model on seen data
+        - make predictions on unseen data 
+        - "screen" a batch of the data with the highest predictions
+        - calculate stopping criterion according to the simulation method
+        - stop screening when criterion says it is safe to do so 
+        """
+        
+        logger.info(
+            f'Simulating stopping method with simulation type {self.simulation_type} on dataset {self.dataset.name} with {self.N} documents available, batch size = {self.batch_size}, and recall target = {self.recall_target}. {self.documents_screened} screened already.')
+        
+        if self.simulation_type==SimulationType.GAP_FILLING and self.current_review_update>0:
+            simulation_within_simulation = ScreeningSimulation(
+                dataset=deepcopy(self.dataset),
+                current_review_update=self.current_review_update,
+                simulation_type=SimulationType.BASELINE,
+                recall_target=self.recall_target,
+                alpha=0,
+                run_id=self.run_id
+            )
+            logger.info("Running simulation within simulation.")
+            simulation_within_simulation.clear_dataset()
+            simulation_within_simulation.prioritised_screening()
+        else:
+            simulation_within_simulation = None
 
-    # predict relevance of the remaining documents (from the unseen df_part dataset)
-    start_time = time.time()
-    y_pred = clf.predict_proba(x_train_unseen)
-    elapsed_time = time.time() - start_time
-    if verbosity > 1:
-        print(f"clf.predict_proba took: {elapsed_time:.2f} seconds")
+        while self.documents_screened < self.N:
+            seen_index = self.df[self.df["sim_seen"] == 1].index
+            unseen_index = self.df[self.df["sim_seen"]==0].index
 
-    # put these predictions in the "prediction" column of the dataframe
-    # fmh: I think we do not need to store these predictions in the dataframe
-    #df_part.loc[unseen_index,'prediction'] = y_pred[:,1]
-    #pdf_part = df_part.loc[unseen_index].sort_values('prediction', ascending=False)
+            clf = self._fit_model(seen_index=seen_index)
+            y_pred = self._make_predictions(clf=clf, unseen_index=unseen_index)
 
-    # get an n batch with highest_predictions
-    #print(np.argsort(np.array(y_pred[:,1]))[:n])
-    batch_idx = unseen_index.values[np.argsort(np.array(y_pred[:,1]))[::-1][:n]]  # this gets the indices that would order the prediction values and uses them to select the batch ids
-    
-    if verbosity > 2:
-        print(batch_idx[:10])
-        print(y_pred[:,1][np.argsort(np.array(y_pred[:,1]))[::-1][:10]])
-    
-    df_part.loc[batch_idx,'sim_seen'] = 1
-    df_part.loc[batch_idx, 'sim_order'] = range(sim_step+1, sim_step+len(batch_idx)+1)
-    current_batch_df = df_part.loc[batch_idx]
-    return df_part, current_batch_df
+            batch_size = min(self.batch_size, y_pred.shape[0])
 
-def order_unseen_by_pred_relevance_lev2(df_part_lev2, x_train, n, sim_step_lev2, verbosity=0):
-    
-    seen_index = df_part_lev2[df_part_lev2['sim_lev2_seen'] == 1].index 
-    # dd: we want to load values only for the random sample and then imitate normal ordering/screening
-    # dd: does this scale to further updates? there is probably a better way to record these values 
-    x_train_seen = x_train[seen_index]
-    unseen_index = df_part_lev2[df_part_lev2['sim_lev2_seen'] == 0].index
-    x_train_unseen = x_train[unseen_index]
+            top_idx = np.argpartition(-y_pred, batch_size - 1)[:batch_size] # does this mess with the simulated screening where it would be in truly descending order (argsort)
+            batch_idx = unseen_index[top_idx]
 
-    clf = SVC(C=0.25, probability=True, class_weight='balanced')
-    # fmh: using standard values for SVM here
-    start_time = time.time()
-    seen_df_part = df_part_lev2[df_part_lev2['sim_lev2_seen'] == 1]
-    clf.fit(x_train_seen, seen_df_part['incl'])
-    elapsed_time = time.time() - start_time
-    if verbosity > 1:
-        print(f"used {len(seen_df_part)} seen docs for training")
-        print(f"clf.fit took: {elapsed_time:.2f} seconds")
+            self.df.loc[batch_idx, 'sim_order'] = list(range(
+                self.documents_screened, self.documents_screened+batch_size
+            ))
+            self.df.loc[batch_idx,'sim_seen'] = 1
+            self.df.loc[batch_idx,SIM_SEEN_IN_UPDATE] = self.current_review_update
 
-    # predict relevance of the remaining documents (from the unseen df_part dataset)
-    start_time = time.time()
-    y_pred = clf.predict_proba(x_train_unseen)
-    elapsed_time = time.time() - start_time
-    if verbosity > 1:
-        print(f"clf.predict_proba took: {elapsed_time:.2f} seconds")
+            ordered_records = self._get_ordered_records(
+                inner_simulation=simulation_within_simulation
+            )
 
-    # put these predictions in the "prediction" column of the dataframe
-    # fmh: I think we do not need to store these predictions in the dataframe
-    #df_part.loc[unseen_index,'prediction'] = y_pred[:,1]
-    #pdf_part = df_part.loc[unseen_index].sort_values('prediction', ascending=False)
+            #self.save_interim_results("interim-screening-results", ordered_records)
+            logger.info(f"Calculating p-value for {len(ordered_records)}, {self.N}")
 
-    # get an n batch with highest_predictions
-    #print(np.argsort(np.array(y_pred[:,1]))[:n])
-    batch_idx = unseen_index.values[np.argsort(np.array(y_pred[:,1]))[::-1][:n]]  # this gets the indices that would order the prediction values and uses them to select the batch ids
-    
-    if verbosity > 2:
-        print(batch_idx[:10])
-        print(y_pred[:,1][np.argsort(np.array(y_pred[:,1]))[::-1][:10]])
-    
-    df_part_lev2.loc[batch_idx,'sim_lev2_seen'] = 1
-    df_part_lev2.loc[batch_idx, 'sim_lev2_order'] = range(sim_step_lev2+1, sim_step_lev2+len(batch_idx)+1)
-    current_batch_df_lev2 = df_part_lev2.loc[batch_idx]
-    return df_part_lev2, current_batch_df_lev2
+            p_val = calculate_h0(
+                ordered_records["incl"].to_numpy(),
+                self.N,
+                recall_target=self.recall_target
+            )
 
+            self.df.loc[batch_idx[-1], "p_score"] = p_val
+            logger.info(f"Lowest p-value was {p_val} at index {batch_idx[-1]}")
 
+            if p_val < self.alpha:
+                logger.info(
+                    f"reached p_value < {self.alpha}." \
+                    f" Recall {self.recall}. " \
+                    f"Proportion screened: {self.prop_screened:.0%}" \
+                    f"({self.documents_screened} / {self.N})"
+                )
+                return
+        logger.info("Finished screening all documents in dataset")
 
-# main function to run a single simulation
-def run_simulation(df, data_name, recall_target, col_name, verbosity=0):
+    def clear_dataset(self) -> None:
+        """Clear out everything apart from the initial random sample."""
+        nonrandom_sample_idx = self.df["random_sample"]==0
+        self.df.loc[nonrandom_sample_idx, "sim_seen"] = 0
+        self.df.loc[nonrandom_sample_idx, "sim_order"] = 0
+        self.df["prediction"] = None
 
-    print(f"starting experiment 1 on dataset {data_name} ({df.shape[0]}) with recall target: {recall_target}")
+    def save_results(self, base_path: str) -> None:
+        """Save results to a parquet table."""
+        results_df = self.df.copy()
+        results_df["dataset_name"] = self.dataset.name
+        results_df["simulation_type"] = self.simulation_type.name
+        results_df["run_id"] = self.run_id
+        results_df["recall_target"] = self.recall_target
+        results_df["alpha"] = self.alpha
 
-    # initiate the default columns 'sim_seen', 'model', and 'id'
-    # force string type on 'title' and 'abstract'
-    df['sim_seen'] = 0
+        table = pa.Table.from_pandas(results_df)
+
+        pq.write_to_dataset(
+            table,
+            root_path=base_path,
+            partition_cols=[
+                "dataset_name",
+                "simulation_type",
+                "alpa",
+                "recall_target"
+            ],
+            existing_data_behavior="delete_matching"
+        )
+
+    def save_interim_results(self, base_path: str, ordered_records) -> None:
+        """Save interim results to file"""
+        interim_results = ordered_records.copy().drop(
+            columns=["p_score"]
+        )
+        interim_results["dataset_name"] = self.dataset.name
+        interim_results["simulation_type"] = self.simulation_type.name
+        interim_results["review_update"] = self.current_review_update
+        interim_results["run_id"] = self.run_id
+        interim_results["recall_target"] = self.recall_target
+        interim_results["alpha"] = self.alpha
+        interim_results[BATCH_NUMBER] = self.documents_screened
+
+        table = pa.Table.from_pandas(interim_results)
+
+        pq.write_to_dataset(
+            table,
+            root_path=base_path,
+            partition_cols=[
+                "dataset_name",
+                "simulation_type",
+                BATCH_NUMBER
+            ],
+            #existing_data_behavior="delete_matching"
+        )
+
+def load_data(dataset_name: str):
+    """
+    Load the data for a synergy dataset with name: dataset_name.
+    Do some cleaning: force titles and abstracts to strings.
+    Split the data into parts.
+    """
+    df = pd.read_csv(
+        Path("synergy_dataset") / f"{dataset_name}.csv"
+    )
+    df["sim_seen"] = 0
+    df[SIM_SEEN_IN_UPDATE] = None
+    df["random_sample"] = 0
+    df["p_score"] = None
+    df[BATCH_NUMBER] = None
+    #np.random.seed(42)
+    #df['publication_year'] = np.random.rand(len(df))
+    df = df.rename(columns={"label_included":"incl"})
     df['title'] = df['title'].apply(str)
     df['abstract'] = df['abstract'].apply(str)
     df['id'] = df.index.astype(str)
-    # fmh: I would try to store this info differently (if running with different types of models at all)
-    #df['model'] = "SVC(C=0.25, probability=True, class_weight='balanced'), retrain=False"
 
     df.sort_values('publication_year', inplace=True) # this is the inital dataset
-    df.reset_index(inplace=True) # ValueError: cannot insert level_0, already exists (worked with a dataset and recall_target 0.99 and 0.95 but then broke)
-
-    # use 'title' and 'abstract' for classification
-    texts = df['title'].fillna('') + ' ' + df['abstract'].fillna('')
-    # create a TF-IDF vectorizer object that will transform text into a matrix of TF-IDF features
-    vectorizer = TfidfVectorizer(max_df=0.5, min_df=5, ngram_range=(1, 2))
-    x_train = vectorizer.fit_transform(texts.fillna(''))
-
-    sim_step = 0 # tracks the current step (in terms of data points) of the simulation
-
-    # introduce an explicit split of the data into 3 parts (assuming there are 3 reviews
-    # spread out in time according to the literature growth)
-
-    # fmh: here, one could introduce different possibilities to allocate the data to slices of review_updates
-
-    # split data into 3 equally sized subsets
-    df['review_update'] = 0
-    for y in range(0, 4):
-        part_startindex = y*round(df.shape[0]/3)
-        part_endindex = (y+1)*round(df.shape[0]/3) - 1
-        df.loc[part_startindex:part_endindex, 'review_update'] = y
-    
-    print("split data into the following parts:")
-    print(df['review_update'].value_counts())
-
-    df_result = pd.DataFrame() # this is where we'll be writing the results
-
-    for current_review_update in range(0, max(df['review_update']+1)):
-        # get the slice of data for each review update
-        df_part = df[df['review_update'] <= current_review_update].copy()
-        n_new_docs = (df['review_update'] == current_review_update).sum()
-        # fmh: x is the length of the current review update plus all previous review updates
-        x = df_part.shape[0]
-        n_seen = df_part[df_part['sim_seen']==1].shape[0]
-        print(f"\nReview update #{current_review_update}: This will cover a total of {x} documents,")
-        print(f"with {n_seen} already seen and {n_new_docs} new documents")
-
-        # for the baseline review, find a random sample
-        if current_review_update == 0:
-
-            df_part = simulate_screening_random_sample(df_part, data_name)
-            df_result = df_part[df_part['sim_seen'] == 1].sort_values('sim_order')
-            sim_step = len(df_result)
-
-        # simulate screening effort within this partial review
-        batch_size = int(max(100, min(0.1 * df_part.shape[0], 500)))
-        print(f'Simulating stopping method with batch size = {batch_size}')
-        # seen_df['sim_order'] = range(1*y, len(seen_df) + 1*y) 
-        # this way, we'll avoid having multiple documents with the same simulated order of screening
-
-        # simulate screening effort within this review update
-        while df_result.shape[0] < x:
-            
-            df_part, current_batch_df = order_unseen_by_pred_relevance(df_part, x_train, batch_size, sim_step, verbosity=verbosity)
-            sim_step += len(current_batch_df)
-            print("length of current batch:", len(current_batch_df))
-            print("current sim_step:", sim_step)
-
-            # fmh: the old structure of the code simulated that each of the documents is seen and then
-            # calculates the probability of the criterion retrospectively.
-            # I would implement this differently: After each iteration above, the criterion is calculated and
-            # if it meets the stopping criterion, then the current order (according to predicted probabilities) is preserved
-
-            df_result = pd.concat([df_result, current_batch_df])
-            
-            # calculate p-values for a recall target
-            # fmh: using calculate_h0 instead of retrospective
-            p_val = calculate_h0(df_result['incl'], df_part.shape[0], recall_target=recall_target)
-
-            if len(df_result) > len(df_part):
-                print('something went wrong ...')
-                break
-
-            df_result.loc[current_batch_df.index, col_name] = p_val
-
-            if verbosity > 1:
-                print("sim step:", sim_step)
-                print("p_val", p_val)
-                print("len df_result:", df_result.shape[0])
-
-            if p_val < alpha:
-                print('reached p_value < 1 - confidence level')
-                break
-
-        # write all recorded values in df
-        df.update(df_part)
-
-        # check recall
-        n_rel_seen = df_part[df_part['sim_seen'] == 1]['incl'].sum()
-        n_rel_tot = df_part['incl'].sum()
-        recall = n_rel_seen / n_rel_tot
-
-        if verbosity > 0:
-            print(f"Relevant seen: {n_rel_seen} of {n_rel_tot}")
-            print("Recall at stopping:", recall)
-            print("Work saved:", df_part['sim_seen'].sum() / len(df_part))
-
-    # add all unseen data to results set
-    df_result = pd.concat([df_result, df[df['sim_seen'] == 0]])
-
-    return df_result
-
-# function to run a simulation of review update > 0 
-# incl. reordering based on predicted relevance (simulation level 2)
-# dd: we re-run the simulation as we might have actually made different 
-# decisions to stop in review updates
-
-def run_simulation_with_reordering(df, data_name, recall_target, col_name, verbosity=0):
-    
-    print(f"starting experiment 2 (simulation with reordering) on dataset {data_name} ({df.shape[0]}) with recall target: {recall_target}")
-
-    # initiate the default columns 'sim_seen', 'model', and 'id'
-    # force string type on 'title' and 'abstract'
-    df['sim_seen'] = 0
-    df['title'] = df['title'].apply(str)
-    df['abstract'] = df['abstract'].apply(str)
-    df['id'] = df.index.astype(str)
-
-    # sort by publication year and reset index
-    df.sort_values('publication_year', inplace=True) 
     df.reset_index(inplace=True) 
-    
-    # use 'title' and 'abstract' for classification
-    texts = df['title'].fillna('') + ' ' + df['abstract'].fillna('')
-    # create a TF-IDF vectorizer object that will transform text into a matrix of TF-IDF features
-    vectorizer = TfidfVectorizer(max_df=0.5, min_df=5, ngram_range=(1, 2))
-    x_train = vectorizer.fit_transform(texts.fillna(''))
 
-    sim_step = 0 # tracks the current step (in terms of data points) of the simulation
-
-    # introduce an explicit split of the data into 3 parts (assuming there are 3 reviews
-    # spread out in time according to the literature growth)
-
-    # fmh: here, one could introduce different possibilities to allocate the data to slices of review_updates
-
-    # split data into 3 equally sized subsets
+    # split data into N_UPDATES equally sized subsets
     df['review_update'] = 0
-    for y in range(0, 4):
-        part_startindex = y*round(df.shape[0]/3)
-        part_endindex = (y+1)*round(df.shape[0]/3) - 1
+    for y in range(0, N_UPDATES+1):
+        part_startindex = y*round(df.shape[0]/N_UPDATES)
+        part_endindex = (y+1)*round(df.shape[0]/N_UPDATES) - 1
         df.loc[part_startindex:part_endindex, 'review_update'] = y
     
-    print("split data into the following parts:")
-    print(df['review_update'].value_counts())
+    logger.info("split data into the following parts:")
+    logger.info(df['review_update'].value_counts())
 
-    df_result = pd.DataFrame() # this is where we'll be writing the results
-
-    # dd: this is where we add simulation level two
-    # for current_review_update in range(1, max(df['review_update']+1))
- 
-    for current_review_update in range(0, max(df['review_update']+1)):
-        # get the slice of data for each review update
-        df_part = df[df['review_update'] <= current_review_update].copy()
-        n_new_docs = (df['review_update'] == current_review_update).sum()
-        # fmh: x is the length of the current review update plus all previous review updates
-        x = df_part.shape[0]
-        n_seen = df_part[df_part['sim_seen']==1].shape[0]
-        print(f"\nReview update #{current_review_update}: This will cover a total of {x} documents,")
-        print(f"with {n_seen} already seen and {n_new_docs} new documents")
-
-        # for the baseline review, find a random sample
-        if current_review_update == 0:
-
-            df_part = simulate_screening_random_sample(df_part, data_name)
-            df_result = df_part[df_part['sim_seen'] == 1].sort_values('sim_order')
-            sim_step = len(df_result)
-
-            batch_size = int(max(100, min(0.1 * df_part.shape[0], 500)))
-            print(f'Simulating stopping method with batch size = {batch_size}')
-
-            # simulate screening effort within this review update
-            while df_result.shape[0] < x:
-                
-                df_part, current_batch_df = order_unseen_by_pred_relevance(df_part, x_train, batch_size, sim_step, verbosity=verbosity)
-                sim_step += len(current_batch_df)
-                # print("length of current batch:", len(current_batch_df))
-                print("current sim_step:", sim_step)
-
-                # fmh: the old structure of the code simulated that each of the documents is seen and then
-                # calculates the probability of the criterion retrospectively.
-                # I would implement this differently: After each iteration above, the criterion is calculated and
-                # if it meets the stopping criterion, then the current order (according to predicted probabilities) is preserved
-
-                df_result = pd.concat([df_result, current_batch_df])
-                
-                # calculate p-values for a recall target
-                # fmh: using calculate_h0 instead of retrospective
-                p_val = calculate_h0(df_result['incl'], df_part.shape[0], recall_target=recall_target)
-
-                if len(df_result) > len(df_part):
-                    print('something went wrong ...')
-                    break
-
-                df_result.loc[current_batch_df.index, col_name] = p_val
-
-                if verbosity > 1:
-                    print("sim step:", sim_step)
-                    print("p_val", p_val)
-                    print("len df_result:", df_result.shape[0])
-
-                if p_val < alpha:
-                    print('reached p_value < 1 - confidence level')
-                    break
-
-            # write all recorded values in df
-            df.update(df_part)
-
-            # check recall
-            n_rel_seen = df_part[df_part['sim_seen'] == 1]['incl'].sum()
-            n_rel_tot = df_part['incl'].sum()
-            recall = n_rel_seen / n_rel_tot
-
-            if verbosity > 0:
-                print(f"Relevant seen: {n_rel_seen} of {n_rel_tot}")
-                print("Recall at stopping:", recall)
-                print("Work saved:", df_part['sim_seen'].sum() / len(df_part))
-        
-        # for the baseline review, find a random sample
-        else:
-
-            batch_size = int(max(100, min(0.1 * df_part.shape[0], 500)))
-            print(f'Simulating stopping method with batch size = {batch_size}')
-
-            # simulate screening effort within this review update
-            while df_result.shape[0] < x:
-                
-                df_part, current_batch_df = order_unseen_by_pred_relevance(df_part, x_train, batch_size, sim_step, verbosity=verbosity)
-                sim_step += len(current_batch_df)
-                # print("length of current batch:", len(current_batch_df))
-                print("current sim_step:", sim_step)
-
-                df_result = pd.concat([df_result, current_batch_df])
-                
-                # calculate p-values for a recall target
-                # fmh: using calculate_h0 instead of retrospective
-                # dd: this is where we add reordering 
-                # rows where sim_order != 1: keep original order
-                mask = df_result['sim_order'] == 1
-                df_keep = df_result[mask]
-
-                # rows where sim_order != 1: sort by predicted relevance (scores from the model)
-                # dd: does this really work or do we have to add a full simulation level 2? 
-                df_sort = df_result[~mask].sort_values('prediction')
-
-                # combine: kept rows first (unchanged), then sorted rows
-                df_reordered = pd.concat([df_keep, df_sort], ignore_index=False)  
-
-                p_val = calculate_h0(df_reordered['incl'], df_part.shape[0], recall_target=recall_target)
-
-                if len(df_reordered) > len(df_part):
-                    print('something went wrong ...')
-                    break
-                
-                # dd: does this still work as expected?
-                df_result.loc[current_batch_df.index, col_name] = p_val
-
-                if verbosity > 1:
-                    print("sim step:", sim_step)
-                    print("p_val", p_val)
-                    print("len df_result:", df_result.shape[0])
-
-                if p_val < alpha:
-                    print('reached p_value < 1 - confidence level')
-                    break
-
-            # write all recorded values in df
-            # dd: this way, we store the original, step-wise order of screening
-            # and only calculate the p-values based on the re-ordered dataframe
-            df.update(df_part)
-
-            # check recall
-            n_rel_seen = df_part[df_part['sim_seen'] == 1]['incl'].sum()
-            n_rel_tot = df_part['incl'].sum()
-            recall = n_rel_seen / n_rel_tot
-
-            if verbosity > 0:
-                print(f"Relevant seen: {n_rel_seen} of {n_rel_tot}")
-                print("Recall at stopping:", recall)
-                print("Work saved:", df_part['sim_seen'].sum() / len(df_part))
-
-    # add all unseen data to results set
-    df_result = pd.concat([df_result, df[df['sim_seen'] == 0]])
-
-    return df_result
-
-def run_simulation_with_level2(df, data_name, recall_target, col_name, verbosity=0):
+    df["texts"] = df['title'].fillna('') + ' ' + df['abstract'].fillna('')
     
-    print(f"starting experiment 3 (simulation with level2) on dataset {data_name} ({df.shape[0]}) with recall target: {recall_target}")
+    return df
 
-    # initiate the default columns 'sim_seen', 'model', and 'id'
-    # force string type on 'title' and 'abstract'
-    df['sim_seen'] = 0
-    df['sim_lev2_seen'] = 0
-    df['title'] = df['title'].apply(str)
-    df['abstract'] = df['abstract'].apply(str)
-    df['id'] = df.index.astype(str)
+def get_run_id() -> int:
+    """Get the SLURM ID from os.environ or set run_id to 1."""
+    try:
+        return int(os.environ["SLURM_ARRAY_TASK_ID"])
+    except KeyError:
+        return 1
 
-    # sort by publication year and reset index
-    df.sort_values('publication_year', inplace=True) 
-    df.reset_index(inplace=True) 
-    
-    # use 'title' and 'abstract' for classification
-    texts = df['title'].fillna('') + ' ' + df['abstract'].fillna('')
-    # create a TF-IDF vectorizer object that will transform text into a matrix of TF-IDF features
-    vectorizer = TfidfVectorizer(max_df=0.5, min_df=5, ngram_range=(1, 2))
-    x_train = vectorizer.fit_transform(texts.fillna(''))
+class SampleError(Exception):
+    pass
 
-    sim_step = 0 # tracks the current step (in terms of data points) of the simulation
+def main(testing: bool = False, workdir: str= "screening_results/"):
 
-    # introduce an explicit split of the data into 3 parts (assuming there are 3 reviews
-    # spread out in time according to the literature growth)
+    run_id = get_run_id()
 
-    # fmh: here, one could introduce different possibilities to allocate the data to slices of review_updates
-
-    # split data into 3 equally sized subsets
-    df['review_update'] = 0
-    for y in range(0, 4):
-        part_startindex = y*round(df.shape[0]/3)
-        part_endindex = (y+1)*round(df.shape[0]/3) - 1
-        df.loc[part_startindex:part_endindex, 'review_update'] = y
-    
-    print("split data into the following parts:")
-    print(df['review_update'].value_counts())
-
-    df_result = pd.DataFrame() # this is where we'll be writing the results
- 
-    for current_review_update in range(0, max(df['review_update']+1)):
-        # get the slice of data for each review update
-        df_part = df[df['review_update'] <= current_review_update].copy()
-        n_new_docs = (df['review_update'] == current_review_update).sum()
-        # fmh: x is the length of the current review update plus all previous review updates
-        x = df_part.shape[0]
-        n_seen = df_part[df_part['sim_seen']==1].shape[0]
-        print(f"\nReview update #{current_review_update}: This will cover a total of {x} documents,")
-        print(f"with {n_seen} already seen and {n_new_docs} new documents")
-
-        # for the baseline review, find a random sample
-        if current_review_update == 0:
-
-            df_part = simulate_screening_random_sample(df_part, data_name) # dd: add if sim_type > 1: sim_lev2_order add in the function?
-            df_result = df_part[df_part['sim_seen'] == 1].sort_values('sim_order')
-            sim_step = len(df_result)
-
-            batch_size = int(max(100, min(0.1 * df_part.shape[0], 500)))
-            print(f'Simulating stopping method with batch size = {batch_size}')
-
-            # simulate screening effort within this review update
-            while df_result.shape[0] < x:
-                
-                df_part, current_batch_df = order_unseen_by_pred_relevance(df_part, x_train, batch_size, sim_step, verbosity=verbosity)
-                sim_step += len(current_batch_df)
-                # print("length of current batch:", len(current_batch_df))
-                print("current sim_step:", sim_step)
-
-                df_result = pd.concat([df_result, current_batch_df])
-                
-                # calculate p-values for a recall target
-                p_val = calculate_h0(df_result['incl'], df_part.shape[0], recall_target=recall_target)
-
-                if len(df_result) > len(df_part):
-                    print('something went wrong ...')
-                    break
-
-                df_result.loc[current_batch_df.index, col_name] = p_val
-
-                if verbosity > 1:
-                    print("sim step:", sim_step)
-                    print("p_val", p_val)
-                    print("len df_result:", df_result.shape[0])
-
-                if p_val < alpha:
-                    print('reached p_value < 1 - confidence level')
-                    break
-
-            # write all recorded values in df
-            df.update(df_part)
-
-            # check recall
-            n_rel_seen = df_part[df_part['sim_seen'] == 1]['incl'].sum()
-            n_rel_tot = df_part['incl'].sum()
-            recall = n_rel_seen / n_rel_tot
-
-            if verbosity > 0:
-                print(f"Relevant seen: {n_rel_seen} of {n_rel_tot}")
-                print("Recall at stopping:", recall)
-                print("Work saved:", df_part['sim_seen'].sum() / len(df_part))
-        
-        # for the updates, simulate with level2
-        else:
-
-            batch_size = int(max(100, min(0.1 * df_part.shape[0], 500)))
-            print(f'Simulating stopping method with batch size = {batch_size}')
-
-            # simulate screening effort within this review update
-            while df_result.shape[0] < x:
-                
-                df_part, current_batch_df = order_unseen_by_pred_relevance(df_part, x_train, batch_size, sim_step, verbosity=verbosity)
-                sim_step += len(current_batch_df)
-                # print("length of current batch:", len(current_batch_df))
-                print("current sim_step:", sim_step)
-
-                df_result = pd.concat([df_result, current_batch_df])
-                
-                # calculate p-values for a recall target
-                # re-order documents by running a sim level2 and comparing sim_level2_seen with sim_seen (gaps)
-                # order_unseen_by_pred_relevance without splitting data into rev 0 and 1
-                df_result_lev2 = pd.DataFrame() # this is where we'll be writing the results of sim level 2
-                sim_step_lev2 = 0
-                
-                # dd: reset sim_lev2_seen and sim_lev_order every time apart from for the random sample
-                df_part_lev2 = df_part.copy()
-                # dd: do not reset these values for df_part.loc[idx] (random sample)
-                # dd: do not reset for documentIDs in random_sample
-                df_part_lev2['sim_lev2_seen'] = 0
-                df_part_lev2['sim_lev2_order'] = 0
-
-                while df_result_lev2.shape[0] < x: 
-
-
-                    df_part_lev2, current_batch_df_lev2 = order_unseen_by_pred_relevance_lev2(df_part_lev2, x_train, batch_size, sim_step_lev2, verbosity=verbosity)
-                    sim_step_lev2 += len(current_batch_df_lev2)
-                    # print("length of current batch:", len(current_batch_df))
-                    print("current sim_step_lev2:", sim_step_lev2)
-
-                    df_result_lev2 = pd.concat([df_result_lev2, current_batch_df_lev2])
-                
-                # re-order documents by sim_lev2_order
-                # df_result = df_result.sort_values(by='sim_lev2_order')
-                p_val = calculate_h0(df_result_lev2['incl'], df_part_lev2.shape[0], recall_target=recall_target)
-
-                if len(df_result_lev2) > len(df_part_lev2):
-                    print('something went wrong ...')
-                    break
-
-                df_result.loc[current_batch_df_lev2.index, col_name] = p_val
-
-                if verbosity > 1:
-                    print("sim step:", sim_step)
-                    print("p_val", p_val)
-                    print("len df_result:", df_result.shape[0])
-
-                if p_val < alpha:
-                    print('reached p_value < 1 - confidence level')
-                    break
-
-                # dd: write p_values, sim_lev2_seen, sim_lev2_order in df_part
-                # check that this works as expected
-                df_part.loc[current_batch_df_lev2.index, col_name] = p_val
-                df_part.loc[current_batch_df_lev2.index, 'sim_lev2_seen'] = 1
-                df_part.loc[current_batch_df_lev2.index, 'sim_lev2_order'] = df_result_lev2.loc[current_batch_df_lev2.index, 'sim_lev2_order']
-
-            # write all recorded values in df
-            
-            df.update(df_part)
-
-            # check recall
-            # add the checks described above in here
-            n_rel_seen = df_part[df_part['sim_seen'] == 1]['incl'].sum()
-            n_rel_tot = df_part['incl'].sum()
-            recall = n_rel_seen / n_rel_tot
-
-            if verbosity > 0:
-                print(f"Relevant seen: {n_rel_seen} of {n_rel_tot}")
-                print("Recall at stopping:", recall)
-                print("Work saved:", df_part['sim_seen'].sum() / len(df_part))
-
-        # add all unseen data to results set
-        df_result = pd.concat([df_result, df[df['sim_seen'] == 0]]) # check
-
-        return df_result # check
-
-if __name__ == "__main__":
-
-    testing = False
-    sim_type = '1' # '1', '2', '3'
-    SIM_FUNCS = {
-    1: run_simulation,
-    2: run_simulation_with_reordering,
-    3: run_simulation_with_level2,
-    }
+    logger.info(f"Initialising living prioritised screening simulation with run_id {run_id}")
 
     if testing:
-
-        dataset_name = 'Wassenaar_2017'
-        recall_target = 0.8
-
-        results_file = f"{dataset_name}-{recall_target}-results-{sim_type}.csv"
-        results_folder = Path("simulated_screening")
-        os.makedirs(results_folder,exist_ok=True)
-    
-        df = pd.read_csv(f"synergy_dataset/{dataset_name}.csv")
-        df['publication_year'] = np.random.rand(len(df))
-        df = df.rename(columns={"label_included":"incl"})
-        
-        sim_time = time.time()    
-        df_res = run_simulation(df, dataset_name, recall_target, 'buscar_p_r080', verbosity=2)
-        sim_time = time.time() - sim_time
-
-        print(f"Simulation took: {sim_time:.2f} seconds")
-
-        df_res.to_csv(results_folder / results_file, index=False)
-        print(f"saved a csv of simulated screening ({sim_type}) for dataset {dataset_name} (recall target: {recall_target})")
+        dataset_names = ["Walker_2018"]
+        recall_targets = [0.8]
+        alphas = [0.05]
+        simulation_types = list(SimulationType)
 
     else:
-        # run through all simulations
-        for d in iter_datasets():
+        recall_targets = [0.99, 0.95, 0.9, 0.8] 
+        alphas = [0.01,0.05,0.10] 
+        dataset_names = [d.name for d in iter_datasets()]
+        simulation_types = list(SimulationType)
 
-            df = pd.read_csv(f"synergy_datasets/{d.name}.csv")
-            if df.shape[0] < 3000: #or df['incl'].sum()/df.shape[0] < 0.01:
-                continue
+    for dataset_name in dataset_names:
+        try:
+            for recall_target in recall_targets:
+                for alpha in alphas:
+                    for simulation_level in simulation_types:
 
-            for recall_target, col_name in zip(recall_targets,col_names):
+                        df = load_data(dataset_name)
 
-                #prepare the directory and filename
-                results_file = f"{d.name}-{recall_target}-results-{sim_type}.csv"
-                results_folder = Path("simulated_screening")
-                os.makedirs(results_folder,exist_ok=True)
-                if (results_folder / results_file).exists():
-                    print(f"Skipping {results_folder / results_file}—file already exists.")  
-                    continue
+                        dataset = ScreeningDataset(df=df, name=dataset_name)
+                        dataset.vectorise()
+                        for current_review_update in range(N_UPDATES):
+                            df = load_data(dataset_name)
 
-                df = df.rename(columns={"label_included":"incl"})
-                df_res = run_simulation(df, d.name, recall_target, col_name)
+                            
+                            logger.info(f"Update: {current_review_update}")
+                            
+                            if current_review_update > 0:
+                                dataset.update(df)
+                                
 
-                df_res.to_csv(results_folder / results_file, index=False)
-                print(f"saved a csv of simulated screening ({sim_type}) for dataset {d.name} (recall target: {recall_target})")
+                            simulation = ScreeningSimulation(
+                                dataset=deepcopy(dataset),
+                                current_review_update=current_review_update,
+                                simulation_type=simulation_level,
+                                recall_target=recall_target,
+                                alpha=alpha,
+                                run_id=run_id
+                            )
+                            if current_review_update==0:
+                                simulation.clear_dataset()
+                                sample_success = simulation.simulate_sample()
+                                logger.info(f"{simulation.df["random_sample"].sum()}")
+                                
+                                if not sample_success:
+                                    raise SampleError("Could not identify random sample") 
+                                
+                            simulation.prioritised_screening()
 
+                            df = simulation.df
 
-        print('end of iteration over all datasets')
+                            if current_review_update == N_UPDATES-1:
+                                simulation.save_results(f"{workdir}/screening_results/")
+        except SampleError as e:
+            logger.info(str(e))
+            continue
+
+if __name__=="__main__":
+    typer.run(main)
