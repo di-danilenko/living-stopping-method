@@ -424,8 +424,7 @@ def main(testing: bool = False, workdir: str= "screening_results/"):
                         dataset = ScreeningDataset(df=df, name=dataset_name)
                         dataset.vectorise()
                         for current_review_update in range(N_UPDATES):
-
-                        df = load_data(dataset_name)
+                            df = load_data(dataset_name)
 
                             
                             logger.info(f"Update: {current_review_update}")
