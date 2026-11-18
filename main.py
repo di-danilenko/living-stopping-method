@@ -28,6 +28,9 @@ class SimulationType(Enum):
 pd.set_option('display.max_columns', 20)
 
 N_UPDATES = 3
+# TODO: test on N_UPDATES = 5 (won't work for all datasets)
+# TODO: test on BASELINE = half the dataset, then yearly updates but at least 
+# 1000 records -- otherwise we are less likely to experience any benefits of automation
 BATCH_NUMBER = "batch_number"
 SIM_SEEN_IN_UPDATE = "sim_seen_in_update"
 
@@ -371,12 +374,42 @@ def load_data(dataset_name: str):
     df.sort_values('publication_year', inplace=True) # this is the inital dataset
     df.reset_index(inplace=True) 
 
-    # split data into N_UPDATES equally sized subsets
+    # # split data into N_UPDATES equally sized subsets
+    # df['review_update'] = 0
+    # for y in range(0, N_UPDATES+1):
+    #     if y==0:
+    #         part_startindex = 0
+    #         part_endindex = round(df.shape[0]/2) - 1 #TODO: minus or plus 1 depending on the rounding direction
+    #     else:
+    #         part_startindex = y*round(df.shape[0]/N_UPDATES)
+    #         part_endindex = (y+1)*round(df.shape[0]/N_UPDATES) - 1
+    #     df.loc[part_startindex:part_endindex, 'review_update'] = y
+
+    # split data update 0 = first half of the dataset; remaining records are split into chunks of at least 1000
     df['review_update'] = 0
-    for y in range(0, N_UPDATES+1):
-        part_startindex = y*round(df.shape[0]/N_UPDATES)
-        part_endindex = (y+1)*round(df.shape[0]/N_UPDATES) - 1
-        df.loc[part_startindex:part_endindex, 'review_update'] = y
+    n = df.shape[0]
+    first_end = round(n/2)                                   # update 0 covers rows 0 .. first_end-1
+    MIN_CHUNK = 1000
+
+    tail = df.iloc[first_end:]                               # records after update 0
+    year_counts = tail['publication_year'].value_counts().sort_index()
+
+    update_of_year = {}
+    y, acc = 1, 0
+    for year, cnt in year_counts.items():
+        update_of_year[year] = y
+        acc += cnt
+        if acc >= MIN_CHUNK:                                 # enough records, close this update
+            y += 1
+            acc = 0
+
+    # leftover years at the end (fewer than MIN_CHUNK records): merge into the previous update
+    if acc > 0 and y > 1:
+        update_of_year = {yr: min(u, y - 1) for yr, u in update_of_year.items()}
+
+    df.loc[tail.index, 'review_update'] = tail['publication_year'].map(update_of_year)
+    N_UPDATES = max(update_of_year.values(), default=0)      # actual number of updates after update 0
+    
     
     logger.info("split data into the following parts:")
     logger.info(df['review_update'].value_counts())
